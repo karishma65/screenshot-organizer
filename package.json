@@ -1,0 +1,31 @@
+{
+  "name": "screenshot-organizer_new",
+  "version": "1.0.0",
+  "description": "",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev:renderer": "cd renderer && npm run dev",
+    "dev:electron": "electron .",
+    "dev": "concurrently \"npm run dev:renderer\" \"wait-on http://localhost:5173 && npm run dev:electron\"",
+    "build:renderer": "cd renderer && npm run build",
+    "start": "electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@tensorflow-models/mobilenet": "^2.1.1",
+    "@tensorflow/tfjs": "^4.22.0",
+    "chokidar": "^5.0.0",
+    "electron": "^42.3.0",
+    "electron-builder": "^26.8.1",
+    "imghash": "^1.1.4",
+    "sqlite3": "^6.0.1",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.0",
+    "electron-rebuild": "^3.2.9",
+    "wait-on": "^9.0.10"
+  }
+}

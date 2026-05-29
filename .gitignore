@@ -1,0 +1,25 @@
+# Dependency directories
+node_modules/
+renderer/node_modules/
+electron/node_modules/
+
+# Personal Data (CRITICAL: Do not upload your screenshots)
+OrganizedScreenshots/
+data/metadata.db
+data/*.db-wal
+data/*.db-shm
+
+# Python cache
+**/__pycache__/
+*.pyc
+
+# Build outputs
+renderer/dist/
+dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env

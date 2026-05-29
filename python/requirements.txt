@@ -1,0 +1,6 @@
+sentence-transformers
+numpy
+pillow
+opencv-python
+flask
+flask-cors
