@@ -49,17 +49,39 @@ db.serialize(() => {
       content_types TEXT,
       tags TEXT,
       confidence REAL DEFAULT 0,
+      confidence_score REAL DEFAULT 0,
       original_hash TEXT,
       study_group_name TEXT,
+      is_duplicate INTEGER DEFAULT 0,
+      duplicate_of INTEGER,
+      similarity_score REAL DEFAULT 0,
+      processing_status TEXT DEFAULT 'queued',
+      error_message TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+
+  // We do not insert defaults here anymore to prevent race conditions with main.js
+  // Defaults are handled in main.js initializePaths() if missing from DB
 });
 
 // Helper for safe logging
 db.log = (action, details, status) => {
   db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)', [action, details, status], (err) => {
-     if (err) console.warn('DB Log skip (too early):', action);
+     if (err) {
+       console.warn('DB Log skip (too early):', action);
+     } else {
+       // Trigger UI update
+       const { ipcMain } = require('electron');
+       ipcMain.emit('force-stats-update');
+     }
   });
 };
 

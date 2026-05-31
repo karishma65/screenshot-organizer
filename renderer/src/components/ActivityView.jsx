@@ -5,7 +5,8 @@ import {
   Info, 
   Search,
   Filter,
-  RefreshCw
+  RefreshCw,
+  Loader2
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 
@@ -45,13 +46,78 @@ const LogItem = ({ type, action, details, timestamp }) => {
 };
 
 const ActivityView = () => {
-  const logs = [
-    { type: 'info', action: 'New screenshot detected', details: 'Screenshot_2026_05_28_105435.png', timestamp: '10:54:35 AM' },
-    { type: 'success', action: 'OCR Completed', details: 'Extracted 158 words from latest capture', timestamp: '10:54:38 AM' },
-    { type: 'success', action: 'Categorized', details: 'Moved to Study → DB Normalization', timestamp: '10:54:40 AM' },
-    { type: 'warning', action: 'Duplicate detected', details: 'Similar to IMG_2345.png (98% match)', timestamp: '10:48:12 AM' },
-    { type: 'info', action: 'Monitoring session started', details: 'Watching C:\\Users\\A.KARISHMA\\Pictures\\Screenshots', timestamp: '10:00:00 AM' },
-  ];
+  const [logs, setLogs] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState(null);
+
+  const fetchLogs = async () => {
+    try {
+      console.log('Renderer: Fetching activity logs...');
+      setLoading(true);
+      const data = await window.electronAPI.getLogs();
+      if (!data) {
+        console.error('get-logs failed: Backend returned null');
+        setLogs([]);
+      } else {
+        setLogs(Array.isArray(data) ? data : []);
+      }
+      setError(null);
+    } catch (e) {
+      console.error('get-logs failed', e);
+      setError(`Failed to load activity: ${e.message}`);
+      setLogs([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  React.useEffect(() => {
+    fetchLogs();
+
+    let unsub = null;
+    try {
+      unsub = window.electronAPI.on('log-updated', (data) => {
+        if (Array.isArray(data)) {
+          setLogs(data);
+        }
+      });
+    } catch (e) {
+      console.error('Failed to subscribe to log-updated', e);
+    }
+
+    return () => {
+      if (unsub) unsub();
+    };
+  }, []);
+
+  const mapType = (status) => {
+    if (status === 'success') return 'success';
+    if (status === 'warning') return 'warning';
+    if (status === 'error') return 'error';
+    return 'info';
+  };
+
+  if (loading) {
+     return (
+       <div className="h-full flex flex-col items-center justify-center gap-4">
+         <Loader2 size={48} className="text-primary animate-spin" />
+         <p className="text-text-dim font-bold uppercase tracking-widest text-xs animate-pulse">Loading activity...</p>
+       </div>
+     );
+  }
+
+  if (error) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-4 text-center p-8">
+        <div className="w-16 h-16 bg-rose-500/20 text-rose-500 rounded-2xl flex items-center justify-center mb-2">
+          <AlertCircle size={32} />
+        </div>
+        <h3 className="text-white font-bold text-lg">Activity Error</h3>
+        <p className="text-text-dim text-sm max-w-xs">{error}</p>
+        <button onClick={fetchLogs} className="mt-4 px-6 py-2 bg-primary text-white rounded-xl font-bold">Retry</button>
+      </div>
+    );
+  }
 
   return (
     <div className="p-8 h-full flex flex-col overflow-hidden">
@@ -80,9 +146,19 @@ const ActivityView = () => {
 
       <div className="flex-1 bg-bg-card-dark border border-border-dark rounded-3xl overflow-hidden flex flex-col shadow-2xl">
         <div className="flex-1 overflow-y-auto">
-          {logs.map((log, i) => (
-            <LogItem key={i} {...log} />
-          ))}
+          {logs.length > 0 ? (
+            logs.map((log, i) => (
+              <LogItem 
+                key={log.id || i} 
+                type={mapType(log.status)}
+                action={log.action}
+                details={log.details}
+                timestamp={log.timestamp}
+              />
+            ))
+          ) : (
+            <div className="p-10 text-center text-text-dim text-sm">No activity logs yet.</div>
+          )}
         </div>
         <div className="p-4 bg-black/20 border-t border-border-dark flex justify-between items-center text-[10px] text-text-dim font-bold uppercase tracking-widest">
           <span>Viewing latest 50 activities</span>

@@ -24,6 +24,24 @@ const SidebarItem = ({ icon: Icon, label, active, onClick }) => (
 );
 
 const Sidebar = ({ activeTab, setActiveTab }) => {
+  const [watchPath, setWatchPath] = React.useState('Loading...');
+
+  React.useEffect(() => {
+    const fetchPath = async () => {
+      try {
+        const paths = await window.electronAPI.getAppPaths();
+        if (paths && paths.watchPath) {
+          setWatchPath(paths.watchPath);
+        } else {
+          setWatchPath('Not configured');
+        }
+      } catch (e) {
+        setWatchPath('Not set');
+      }
+    };
+    fetchPath();
+  }, []);
+
   const menuItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard' },
     { id: 'categories', icon: FolderTree, label: 'Categories' },
@@ -64,9 +82,9 @@ const Sidebar = ({ activeTab, setActiveTab }) => {
         </div>
         <div className="bg-white/5 rounded-lg p-3">
           <p className="text-[10px] text-text-dim uppercase tracking-wider mb-2 font-semibold">Screenshot Folder</p>
-          <p className="text-xs text-white truncate max-w-full">C:\Users\A.KARISHMA\Pictures\Screenshots</p>
+          <p className="text-xs text-white truncate max-w-full">{watchPath}</p>
           <button 
-            onClick={() => window.electronAPI.openFolder('C:\\Users\\A.KARISHMA\\Pictures\\Screenshots')}
+            onClick={() => window.electronAPI.openFolder(watchPath)}
             className="w-full mt-3 py-2 bg-white/5 hover:bg-white/10 text-white text-xs rounded transition-colors"
           >
             Open Folder

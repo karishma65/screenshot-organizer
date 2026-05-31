@@ -1,5 +1,6 @@
 const { contextBridge, ipcRenderer, shell } = require('electron');
-const path = require('path');
+
+console.log('PRELOAD LOADED');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   send: (channel, data) => {
@@ -20,9 +21,26 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener(channel, subscription);
   },
   getSystemInfo: () => process.versions,
-  openFolder: (folderPath) => shell.openPath(folderPath),
-  getOrganizedPath: () => 'D:\\vit\\Screenshot organizer_new\\OrganizedScreenshots',
+  getAppPaths: () => ipcRenderer.invoke('get-app-paths'),
+  getSystemStatus: () => ipcRenderer.invoke('get-system-status'),
+  setAppPaths: (paths) => ipcRenderer.invoke('set-app-paths', paths),
+  selectFolder: () => {
+    console.log('Preload: Invoking select-folder IPC');
+    return ipcRenderer.invoke('select-folder');
+  },
   getStats: () => ipcRenderer.invoke('get-stats'),
   getLogs: () => ipcRenderer.invoke('get-logs'),
+  getDuplicates: () => ipcRenderer.invoke('get-duplicates'),
+  getDuplicateStats: () => ipcRenderer.invoke('get-duplicate-stats'),
+  deleteDuplicate: (id) => ipcRenderer.invoke('delete-duplicate', id),
+  keepBothDuplicate: (id) => ipcRenderer.invoke('keep-both-duplicate', id),
+  searchScreenshots: (query) => ipcRenderer.invoke('search-screenshots', query),
+  getCategoryDetails: (category) => ipcRenderer.invoke('get-category-details', category),
+  revealScreenshot: (filePath) => ipcRenderer.invoke('reveal-screenshot', filePath),
+  getPlatforms: () => ipcRenderer.invoke('get-platforms'),
+  getRebuildStatus: () => ipcRenderer.invoke('get-rebuild-status'),
   rebuildLibrary: () => ipcRenderer.invoke('rebuild-library'),
+  openFolder: (path) => ipcRenderer.send('open-folder', path),
 });
+
+console.log('ELECTRON API EXPOSED');

@@ -19,19 +19,18 @@ function sendProgress(mainWindow) {
   });
 }
 
-const WATCH_PATH = 'C:\\Users\\A.KARISHMA\\Pictures\\Screenshots';
-
 /**
  * Initial Scan: Processes all existing screenshots in the directory
  */
-async function initialScan(mainWindow) {
-  console.log('Core: Starting initial bulk scan...');
+async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = false) {
+  if (!watchPath || !fs.existsSync(watchPath)) return;
+  console.log(`Core: Starting ${isRebuild ? 'library rebuild' : 'initial bulk scan'}...`);
   
   // Wait 1 second to ensure DB tables are ready
   await new Promise(resolve => setTimeout(resolve, 1000));
   
   try {
-    const files = fs.readdirSync(WATCH_PATH);
+    const files = fs.readdirSync(watchPath);
     const imageFiles = files.filter(file => 
       ['.png', '.jpg', '.jpeg', '.webp'].includes(path.extname(file).toLowerCase())
     );
@@ -40,7 +39,18 @@ async function initialScan(mainWindow) {
     processedCount = 0;
     console.log(`Core: Found ${totalFiles} existing screenshots to check.`);
     
-    db.log('Bulk Scan Started', `Scanning ${totalFiles} existing files`, 'info');
+    db.log(isRebuild ? 'Library Rebuild Started' : 'Bulk Scan Started', `Scanning ${totalFiles} existing files`, 'info');
+
+    // Update global state if it's a rebuild
+    if (isRebuild && mainWindow) {
+      mainWindow.webContents.send('rebuild-progress', {
+        active: true,
+        phase: 'Scanning files',
+        filesProcessed: 0,
+        totalFiles: totalFiles,
+        percentage: 0
+      });
+    }
 
     // Send initial progress (0%)
     sendProgress(mainWindow);
@@ -48,11 +58,23 @@ async function initialScan(mainWindow) {
     let batchCounter = 0;
 
     for (const file of imageFiles) {
-      const filePath = path.join(WATCH_PATH, file);
-      await processScreenshot(filePath, mainWindow);
+      const filePath = path.join(watchPath, file);
+      await processScreenshot(filePath, mainWindow, organizedPath);
       processedCount++;
       batchCounter++;
       
+      const percentage = totalFiles > 0 ? Math.round((processedCount / totalFiles) * 100) : 0;
+
+      if (isRebuild && mainWindow) {
+        mainWindow.webContents.send('rebuild-progress', {
+          active: true,
+          phase: 'Processing screenshots',
+          filesProcessed: processedCount,
+          totalFiles: totalFiles,
+          percentage: percentage
+        });
+      }
+
       sendProgress(mainWindow);
       
       // 1. Tiny pause between every file (Fast)
@@ -70,22 +92,47 @@ async function initialScan(mainWindow) {
 
     console.log('Core: Initial scan complete.');
     db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)', 
-      ['Bulk Scan Finished', 'All existing files processed', 'success']);
+      [isRebuild ? 'Library Rebuild Finished' : 'Bulk Scan Finished', 'All existing files processed', 'success']);
+
+    if (isRebuild && mainWindow) {
+      mainWindow.webContents.send('rebuild-progress', {
+        active: false,
+        phase: 'Completed',
+        filesProcessed: processedCount,
+        totalFiles: totalFiles,
+        percentage: 100
+      });
+    }
 
   } catch (error) {
     console.error('Core: Initial scan error:', error);
+    if (isRebuild && mainWindow) {
+      mainWindow.webContents.send('rebuild-progress', {
+        active: false,
+        phase: 'Failed',
+        filesProcessed: processedCount,
+        totalFiles: totalFiles,
+        percentage: 0
+      });
+    }
   }
 }
+
+let activeWatcher = null;
 
 /**
  * Continuous Watcher: Monitors for future screenshot additions
  */
-function startWatcher(mainWindow) {
+function startWatcher(mainWindow, watchPath, organizedPath) {
+  if (activeWatcher) {
+    activeWatcher.close();
+  }
+
   // 1. Kick off the initial scan immediately
-  initialScan(mainWindow);
+  initialScan(mainWindow, watchPath, organizedPath);
 
   // 2. Start the continuous watcher for new files
-  const watcher = chokidar.watch(WATCH_PATH, {
+  activeWatcher = chokidar.watch(watchPath, {
     ignored: /(^|[\/\\])\../,
     persistent: true,
     ignoreInitial: true, // Crucial: initialScan() handles the existing files
@@ -103,12 +150,19 @@ function startWatcher(mainWindow) {
         payload: { path: filePath, filename: path.basename(filePath) }
       });
     }
-    processScreenshot(filePath, mainWindow);
+    processScreenshot(filePath, mainWindow, organizedPath);
   }, 200);
 
-  watcher.on('add', debouncedAdd);
+  activeWatcher.on('add', debouncedAdd);
 
-  return watcher;
+  return activeWatcher;
+}
+
+function stopWatcher() {
+  if (activeWatcher) {
+    activeWatcher.close();
+    activeWatcher = null;
+  }
 }
 
 /** Simple debounce utility */
@@ -120,4 +174,4 @@ function debounce(fn, wait) {
   };
 }
 
-module.exports = { startWatcher };
+module.exports = { startWatcher, initialScan, stopWatcher };

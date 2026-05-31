@@ -10,15 +10,19 @@ import {
   Copy,
   LayoutGrid,
   ChevronRight,
-  FolderOpen
+  FolderOpen,
+  Inbox,
+  Loader2,
+  AlertCircle
 } from 'lucide-react';
 import { motion } from 'framer-motion';
+import CategoryDetailView from './CategoryDetailView';
 
-const CategoryCard = ({ icon: Icon, label, count, color, dbKey }) => (
+const CategoryCard = ({ icon: Icon, label, count, color, dbKey, onClick }) => (
   <motion.button 
     whileHover={{ y: -5, scale: 1.02 }}
     whileTap={{ scale: 0.98 }}
-    onClick={() => window.electronAPI.openFolder(`D:\\vit\\Screenshot organizer_new\\OrganizedScreenshots\\${dbKey}`)}
+    onClick={onClick}
     className="bg-bg-card-dark border border-border-dark p-6 rounded-3xl flex flex-col items-center text-center gap-4 group transition-all relative overflow-hidden"
   >
     <div className={`p-4 rounded-2xl ${color} shadow-lg transition-transform group-hover:scale-110 z-10`}>
@@ -29,36 +33,104 @@ const CategoryCard = ({ icon: Icon, label, count, color, dbKey }) => (
       <p className="text-xs text-text-dim mt-1 font-bold uppercase tracking-widest">{count} Items</p>
     </div>
     <div className="absolute right-4 bottom-4 opacity-0 group-hover:opacity-100 transition-opacity">
-       <FolderOpen size={16} className="text-primary" />
+       <ChevronRight size={16} className="text-primary" />
     </div>
   </motion.button>
 );
 
 const CategoriesView = () => {
   const [counts, setCounts] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [selectedCategory, setSelectedCategory] = useState(null);
 
   useEffect(() => {
     const fetchCounts = async () => {
-       const stats = await window.electronAPI.getStats();
-       // This will be dynamic after we update the IPC to return category breakdown
-       // For now, we'll map the total counts
-       setCounts(stats.breakdown || {});
+      try {
+        console.log('Renderer: Fetching category stats...');
+        setError(null);
+        setLoading(true);
+        const stats = await window.electronAPI.getStats();
+        
+        if (!stats) {
+          console.error('get-stats failed: Backend returned null');
+          setError('Backend failed to return data.');
+          return;
+        }
+
+        if (stats.breakdown) {
+          setCounts(stats.breakdown);
+        } else {
+          console.warn('get-stats: breakdown missing in response');
+          setCounts({});
+        }
+      } catch (e) {
+        console.error('get-stats failed', e);
+        setError(`System Error: ${e.message}`);
+      } finally {
+        setLoading(false);
+      }
     };
     fetchCounts();
-    const interval = setInterval(fetchCounts, 5000);
-    return () => clearInterval(interval);
+
+    let unsub = null;
+    try {
+      unsub = window.electronAPI.on('stats-updated', (data) => {
+        if (data && data.breakdown) {
+          setCounts(data.breakdown);
+        }
+      });
+    } catch (e) {
+      console.error('Failed to subscribe to stats-updated', e);
+    }
+
+    return () => {
+      if (unsub) unsub();
+    };
   }, []);
 
+  // Category detail view
+  if (selectedCategory) {
+    return (
+      <CategoryDetailView
+        category={selectedCategory.dbKey}
+        categoryLabel={selectedCategory.label}
+        onBack={() => setSelectedCategory(null)}
+      />
+    );
+  }
+
   const categories = [
-    { icon: BookOpen, label: 'Study', count: counts['Study'] || 0, color: 'bg-blue-600', dbKey: 'Study' },
-    { icon: Share2, label: 'Social Media', count: counts['Social Media'] || 0, color: 'bg-primary', dbKey: 'Social Media' },
-    { icon: MessageSquare, label: 'Communication', count: counts['Communication'] || 0, color: 'bg-emerald-600', dbKey: 'Communication' },
-    { icon: ShoppingBag, label: 'Shopping', count: counts['Shopping'] || 0, color: 'bg-orange-600', dbKey: 'Shopping' },
-    { icon: Bot, label: 'AI Chats', count: counts['AI Chats'] || 0, color: 'bg-indigo-600', dbKey: 'AI Chats' },
-    { icon: Files, label: 'Documents', count: counts['Documents'] || 0, color: 'bg-cyan-600', dbKey: 'Documents' },
-    { icon: Copy, label: 'Duplicates', count: counts['Duplicates'] || 0, color: 'bg-slate-600', dbKey: 'Duplicates' },
-    { icon: Files, label: 'Uncategorized', count: counts['Uncategorized'] || 0, color: 'bg-gray-600', dbKey: 'Uncategorized' },
+    { icon: BookOpen, label: 'Study', count: counts['STUDY'] || 0, color: 'bg-blue-600', dbKey: 'STUDY' },
+    { icon: Share2, label: 'Social Media', count: counts['SOCIAL MEDIA'] || 0, color: 'bg-primary', dbKey: 'SOCIAL MEDIA' },
+    { icon: MessageSquare, label: 'Communication', count: counts['COMMUNICATION'] || 0, color: 'bg-emerald-600', dbKey: 'COMMUNICATION' },
+    { icon: ShoppingBag, label: 'Shopping', count: counts['SHOPPING'] || 0, color: 'bg-orange-600', dbKey: 'SHOPPING' },
+    { icon: Bot, label: 'AI Chats', count: counts['AI CHATS'] || 0, color: 'bg-indigo-600', dbKey: 'AI CHATS' },
+    { icon: Files, label: 'Uncategorized', count: counts['UNCATEGORIZED'] || 0, color: 'bg-gray-600', dbKey: 'UNCATEGORIZED' },
   ];
+
+  const totalCount = Object.values(counts).reduce((a, b) => a + b, 0);
+
+  if (loading) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-4">
+        <Loader2 size={48} className="text-primary animate-spin" />
+        <p className="text-text-dim font-bold uppercase tracking-widest text-xs animate-pulse">Loading categories...</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-4 text-center p-8">
+        <div className="w-16 h-16 bg-rose-500/20 text-rose-500 rounded-2xl flex items-center justify-center mb-2">
+          <AlertCircle size={32} />
+        </div>
+        <h3 className="text-white font-bold text-lg">Error</h3>
+        <p className="text-text-dim text-sm max-w-xs">{error}</p>
+      </div>
+    );
+  }
 
   return (
     <div className="p-8 h-full overflow-y-auto">
@@ -69,11 +141,25 @@ const CategoriesView = () => {
         </div>
       </header>
 
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 pb-10">
-        {categories.map((cat, i) => (
-          <CategoryCard key={i} {...cat} />
-        ))}
-      </div>
+      {totalCount === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <Inbox size={56} className="text-text-dim opacity-20 mb-4" />
+          <h3 className="text-white font-bold text-xl mb-2">No screenshots yet</h3>
+          <p className="text-text-dim text-sm max-w-sm">
+            Your categories will populate automatically as screenshots are processed by the AI engine.
+          </p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 pb-10">
+          {categories.map((cat, i) => (
+            <CategoryCard 
+              key={i} 
+              {...cat} 
+              onClick={() => setSelectedCategory(cat)}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 };

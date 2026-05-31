@@ -1,171 +1,223 @@
 const { extractText } = require('./ocr_analyzer');
 const { detectPlatform } = require('./ui_analyzer');
 const { classifyImage } = require('./visual_analyzer');
+const { analyzeLayout } = require('./layout_analyzer');
 const imghash = require('imghash');
 const db = require('./database');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 
-/**
- * 4. SEMANTIC ANALYZER (Python Bridge)
- */
+// 7. PREVENT DUPLICATE WATCHER TRIGGERS
+const processingQueue = new Set();
+
 async function getSemanticGroup(text) {
   return new Promise((resolve) => {
-    // Try 'python' then 'py' then 'python3'
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    console.log(`Pipeline: Calling Semantic AI (${pythonCmd})...`);
-    
-    const pythonProcess = spawn(pythonCmd, [
-      path.join(__dirname, '../python/analyzer.py'), 
-      text
-    ]);
+    try {
+      const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+      const pythonProcess = spawn(pythonCmd, [
+        path.join(__dirname, '../python/analyzer.py'), 
+        'analyze_semantic',
+        text
+      ]);
 
-    let output = '';
-    pythonProcess.stdout.on('data', (data) => {
-      output += data.toString();
-    });
+      let output = '';
+      pythonProcess.stdout.on('data', (data) => { output += data.toString(); });
 
-    pythonProcess.on('close', (code) => {
-      if (code !== 0 || !output.trim()) {
-        resolve('Unsorted');
-        return;
-      }
-      try {
-        const result = JSON.parse(output);
-        resolve(result.study_group || 'Unsorted');
-      } catch (e) {
-        console.error('Semantic Parse Error:', e.message);
-        resolve('Unsorted');
-      }
-    });
+      pythonProcess.on('close', (code) => {
+        if (code !== 0 || !output.trim()) {
+          resolve('UNCATEGORIZED');
+          return;
+        }
+        try {
+          const result = JSON.parse(output);
+          resolve(result.study_group.toUpperCase() || 'UNCATEGORIZED');
+        } catch (e) {
+          resolve('UNCATEGORIZED');
+        }
+      });
+    } catch (e) {
+      resolve('UNCATEGORIZED');
+    }
   });
 }
 
-/**
- * 6. CONFIDENCE ENGINE
- */
-function calculateConfidence(results) {
+function calculateConfidence(text, platform, layout, studyGroup) {
   let score = 0;
-  if (results.ocr) score += 0.2;
-  if (results.ui !== 'UNKNOWN') score += 0.3;
-  if (results.visual.length > 0) score += 0.2;
-  if (results.semantic !== 'Unsorted') score += 0.3;
-  return score;
+  
+  // Weights:
+  // Platform Detection: 0.4
+  // Semantic Match: 0.3
+  // OCR Quality: 0.2
+  // Layout Match: 0.1
+
+  if (platform !== 'UNKNOWN') score += 0.4;
+  if (studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') score += 0.3;
+  if (text.length > 50) score += 0.2;
+  if (layout !== 'UNKNOWN_LAYOUT' && layout !== 'DOCUMENT_LAYOUT') score += 0.1;
+
+  return Math.min(score, 1.0);
 }
 
-async function processScreenshot(filePath, mainWindow) {
-  try {
-    console.log(`Pipeline: Processing ${path.basename(filePath)}...`);
+async function processScreenshot(filePath, mainWindow, organizedRoot) {
+  if (!organizedRoot) return;
+  if (processingQueue.has(filePath)) return;
+  processingQueue.add(filePath);
 
-    // 0. DUPLICATE DETECTION (pHash)
-    let phash = 'error_hash';
+  let currentId = null;
+  let errorMessage = '';
+
+  try {
+    const fileName = path.basename(filePath);
+    
+    await new Promise((resolve) => {
+      db.run('INSERT OR IGNORE INTO screenshots (original_path, filename, processing_status) VALUES (?, ?, ?)', 
+        [filePath, fileName, 'processing'], function(err) {
+          currentId = this.lastID;
+          resolve();
+        }
+      );
+    });
+
+    db.log('ANALYSIS_START', `Processing: ${fileName}`, 'info');
+
+    // 0. pHash & DUPLICATE DETECTION
+    let phash = 'ERROR';
     try {
       phash = await imghash.hash(filePath);
-      console.log('Pipeline: pHash Generated.');
     } catch (e) {
-      console.warn(`pHash Failed:`, e.message);
+      console.warn('pHash Failed');
     }
     
-    // Check DB for matches
     const existing = await new Promise(resolve => {
-      db.get('SELECT id FROM screenshots WHERE original_hash = ? OR original_path = ?', [phash, filePath], (err, row) => resolve(row));
+      db.get('SELECT id, original_hash FROM screenshots WHERE (original_hash = ? OR original_path = ?) AND id != ? AND processing_status = "completed"', 
+        [phash, filePath, currentId], (err, row) => resolve(row));
     });
+
     if (existing) {
-      console.log('Pipeline: Skipping (already indexed).');
+      db.run('UPDATE screenshots SET is_duplicate = 1, duplicate_of = ?, similarity_score = 100, processing_status = "completed", main_category = "DUPLICATES" WHERE id = ?', 
+        [existing.id, currentId]);
+      db.log('DUPLICATE_DETECTED', `${fileName} is a duplicate of ${existing.id}`, 'warning');
+      processingQueue.delete(filePath);
       return;
     }
 
-    // 1. OCR ANALYZER
-    console.log('Pipeline: Running OCR...');
-    const text = await extractText(filePath);
-    const lowerText = text.toLowerCase();
+    // 1. OCR
+    let text = '';
+    try {
+        text = await extractText(filePath);
+    } catch (e) {
+        errorMessage += `OCR Failed; `;
+    }
 
-    // 2. UI ANALYZER (Platform)
-    const platform = detectPlatform(text);
-    console.log(`Pipeline: Platform detected -> ${platform}`);
+    // 2. Layout Analysis (New)
+    let layout = 'UNKNOWN_LAYOUT';
+    try {
+      layout = await analyzeLayout(filePath);
+    } catch (e) {
+      errorMessage += `Layout AI Failed; `;
+    }
 
-    // 3. IMAGE CLASSIFIER (Visual Content Types)
-    console.log('Pipeline: Running Visual AI...');
+    // 3. Platform Detection
+    let platform = 'UNKNOWN';
+    try {
+        platform = detectPlatform(text, layout).toUpperCase();
+    } catch (e) {
+        platform = 'UNKNOWN';
+    }
+
+    // 4. Visual AI
     let visualTags = [];
     try {
-      visualTags = await classifyImage(filePath);
-      console.log(`Pipeline: Visual tags -> ${visualTags.join(', ')}`);
+        visualTags = await classifyImage(filePath);
     } catch (e) {
-      console.warn(`Visual AI Failed:`, e.message);
+        errorMessage += `Visual AI Failed; `;
     }
 
-    // 4. LAYOUT ANALYZER (Simulated via text structure)
-    // Identify "Code" or "Chat" layouts
-    if (lowerText.includes('const ') || lowerText.includes('import ')) visualTags.push('code');
-    if (lowerText.includes('message') || lowerText.includes('whatsapp')) visualTags.push('chat');
-
-    // 5. SEMANTIC ANALYZER (Context / Study Clusters)
-    let studyGroup = 'None';
-    if (text.length > 50) {
-      studyGroup = await getSemanticGroup(text);
+    // 5. Semantic Analysis
+    let studyGroup = 'NONE';
+    try {
+        if (text.length > 30) {
+          studyGroup = await getSemanticGroup(text);
+        }
+    } catch (e) {
+        studyGroup = 'UNCATEGORIZED';
     }
 
-    // 6. CONFIDENCE ENGINE
-    const confidence = calculateConfidence({ ocr: text, ui: platform, visual: visualTags, semantic: studyGroup });
+    // 6. Confidence Engine
+    const confidenceScore = calculateConfidence(text, platform, layout, studyGroup);
 
-    // FINAL CATEGORIZATION DECISION
-    let mainCategory = 'Uncategorized';
+    // 7. Category Mapping (Strict Allowed Categories)
+    let mainCategory = 'UNCATEGORIZED';
     
-    if (confidence < 0.4) {
-      mainCategory = 'Uncategorized';
-    } else if (studyGroup !== 'None' && (platform === 'YouTube' || platform === 'UNKNOWN')) {
-      mainCategory = 'Study';
-    } else if (['CHATGPT', 'GEMINI', 'CLAUDE'].includes(platform)) {
-      mainCategory = 'AI Chats';
-    } else if (['INSTAGRAM', 'YOUTUBE', 'FACEBOOK'].includes(platform)) {
-      mainCategory = 'Social Media';
-    } else if (['WHATSAPP', 'DISCORD', 'SLACK'].includes(platform)) {
-      mainCategory = 'Communication';
-    } else if (['AMAZON', 'FLIPKART', 'MEESHO'].includes(platform)) {
-      mainCategory = 'Shopping';
-    } else if (visualTags.includes('code')) {
-      mainCategory = 'Study'; // Or Personal depending on context
+    // Priority Logic
+    if (['CHATGPT', 'GEMINI', 'CLAUDE', 'ANTIGRAVITY'].includes(platform)) {
+      mainCategory = 'AI CHATS';
+    } else if (['WHATSAPP', 'TELEGRAM', 'DISCORD', 'SLACK'].includes(platform) || layout === 'CHAT_LAYOUT') {
+      mainCategory = 'COMMUNICATION';
+    } else if (['AMAZON', 'FLIPKART'].includes(platform)) {
+      mainCategory = 'SHOPPING';
+    } else if (['PAYTM', 'UPI', 'WALLET'].includes(platform) || text.toLowerCase().includes('payment')) {
+      mainCategory = 'FINANCE';
+    } else if (['NETFLIX', 'YOUTUBE'].includes(platform)) {
+      mainCategory = 'ENTERTAINMENT';
+    } else if (['INSTAGRAM', 'FACEBOOK', 'LINKEDIN'].includes(platform)) {
+      mainCategory = 'SOCIAL MEDIA';
+    } else if (studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') {
+      mainCategory = 'STUDY';
+    } else if (text.length > 200 || layout === 'DOCUMENT_LAYOUT') {
+      mainCategory = 'DOCUMENTS';
     }
 
-    // 7. PHYSICAL ORGANIZATION (SINGLE COPY ONLY)
-    // ONLY use subfolders for intelligence-rich categories
-    const subFolderCategories = ['Study', 'AI Chats', 'Social Media', 'Communication', 'Shopping'];
-    let organizedRoot = path.join(__dirname, '../OrganizedScreenshots', mainCategory);
-    
-    if (subFolderCategories.includes(mainCategory)) {
-      let subFolder = studyGroup !== 'None' ? studyGroup : platform !== 'UNKNOWN' ? platform : 'General';
-      organizedRoot = path.join(organizedRoot, subFolder);
+    // THRESHOLD CHECK: Force to UNCATEGORIZED if confidence is low
+    if (confidenceScore < 0.40) {
+      mainCategory = 'UNCATEGORIZED';
+    }
+
+    // 8. PHYSICAL ORGANIZATION
+    let organizedDir = path.join(organizedRoot, mainCategory);
+    if (mainCategory === 'STUDY' && studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') {
+      organizedDir = path.join(organizedDir, studyGroup);
+    }
+
+    if (!fs.existsSync(organizedDir)) {
+      fs.mkdirSync(organizedDir, { recursive: true });
     }
     
-    if (!fs.existsSync(organizedRoot)) {
-      fs.mkdirSync(organizedRoot, { recursive: true });
-    }
-    
-    const destPath = path.join(organizedRoot, path.basename(filePath));
+    const destPath = path.join(organizedDir, fileName);
     fs.copyFileSync(filePath, destPath);
 
-    // 8. METADATA SAVE (Bridges ALL Tags)
-    const contentTags = JSON.stringify(visualTags);
+    // 9. DB SAVE
     db.run(`
-      INSERT INTO screenshots (
-        original_path, organized_path, filename, ocr_text, 
-        main_category, platform, content_types, 
-        original_hash, confidence, study_group_name
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      UPDATE screenshots SET 
+        original_path = ?, organized_path = ?, filename = ?, ocr_text = ?, 
+        main_category = ?, platform = ?, content_types = ?, 
+        original_hash = ?, study_group_name = ?, tags = ?,
+        processing_status = 'completed', confidence_score = ?, error_message = ?
+      WHERE id = ?
     `, [
-      filePath, destPath, path.basename(filePath), text,
-      mainCategory, platform, contentTags,
-      phash, confidence, studyGroup
-    ]);
+      filePath, destPath, fileName, text,
+      mainCategory, platform, JSON.stringify(visualTags),
+      phash, studyGroup, layout,
+      confidenceScore, errorMessage || null,
+      currentId
+    ], (err) => {
+      const { ipcMain } = require('electron');
+      ipcMain.emit('force-stats-update');
+    });
 
-    // Notify Renderer
+    db.log('CATEGORIZED', `${fileName} → ${mainCategory} (${Math.round(confidenceScore * 100)}% conf)`, 'success');
+
+  } catch (error) {
+    console.error('Pipeline Crash:', error);
+    if (currentId) {
+      db.run('UPDATE screenshots SET processing_status = "failed", error_message = ? WHERE id = ?', [error.message, currentId]);
+    }
+  } finally {
+    processingQueue.delete(filePath);
     if (mainWindow) {
       mainWindow.webContents.send('scan-progress', { processed: 1 });
     }
-
-  } catch (error) {
-    console.error('Pipeline Error:', error);
   }
 }
 
