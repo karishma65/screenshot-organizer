@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Search, Filter, Image as ImageIcon, Calendar, Tag, ChevronDown, FolderOpen, Info, Inbox, AlertCircle, Loader2 } from 'lucide-react';
 import { motion } from 'framer-motion';
 
-const SearchResultCard = ({ filename, main_category, platform, created_at, organized_path, original_path }) => {
+const SearchResultCard = ({ filename, main_category, subcategory, platform, final_confidence, created_at, organized_path, original_path }) => {
   const [imgError, setImgError] = useState(false);
   const imagePath = organized_path || original_path;
   const imageUrl = imagePath ? `screenshot://${encodeURIComponent(imagePath)}` : '';
@@ -18,7 +18,7 @@ const SearchResultCard = ({ filename, main_category, platform, created_at, organ
   return (
     <motion.div 
       whileHover={{ y: -4 }}
-      className="bg-bg-card-dark border border-border-dark rounded-2xl overflow-hidden group cursor-pointer"
+      className="bg-bg-card-dark border border-border-dark rounded-2xl overflow-hidden group cursor-pointer h-full flex flex-col"
       onClick={handleReveal}
     >
       <div className="aspect-video bg-white/5 flex items-center justify-center relative group-hover:bg-white/10 transition-colors overflow-hidden">
@@ -38,16 +38,24 @@ const SearchResultCard = ({ filename, main_category, platform, created_at, organ
         <div className="absolute top-2 right-2 px-2 py-1 bg-black/60 backdrop-blur-md rounded-md text-[10px] text-white font-bold opacity-0 group-hover:opacity-100 transition-opacity uppercase tracking-wider flex items-center gap-1">
           <FolderOpen size={10} /> Reveal
         </div>
+        {final_confidence > 0 && (
+          <div className="absolute left-2 bottom-2 px-2 py-0.5 bg-black/40 backdrop-blur-md rounded-md text-[8px] text-primary font-black uppercase tracking-tighter">
+            {Math.round(final_confidence * 100)}% Match
+          </div>
+        )}
       </div>
-      <div className="p-4">
+      <div className="p-4 flex-1 flex flex-col">
         <h4 className="text-sm font-bold text-white truncate mb-1">{filename}</h4>
-        <div className="flex gap-2 mb-3 flex-wrap">
-          <span className="text-[9px] px-2 py-0.5 bg-primary/10 text-primary rounded-full font-bold uppercase">{main_category}</span>
+        <div className="flex gap-1.5 mb-3 flex-wrap">
+          <span className="text-[8px] px-1.5 py-0.5 bg-primary/10 text-primary border border-primary/20 rounded font-black uppercase">{main_category}</span>
+          {subcategory && subcategory !== 'NONE' && (
+            <span className="text-[8px] px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded font-black uppercase">{subcategory}</span>
+          )}
           {platform && platform !== 'UNKNOWN' && (
-            <span className="text-[9px] px-2 py-0.5 bg-white/5 text-text-dim rounded-full font-bold uppercase">{platform}</span>
+            <span className="text-[8px] px-1.5 py-0.5 bg-white/5 text-text-dim border border-white/10 rounded font-black uppercase">{platform}</span>
           )}
         </div>
-        <div className="flex justify-between items-center text-[10px] text-text-dim font-medium">
+        <div className="mt-auto flex justify-between items-center text-[9px] text-text-dim font-bold uppercase tracking-tighter opacity-60">
           <span className="flex items-center gap-1"><Calendar size={10} /> {new Date(created_at).toLocaleDateString()}</span>
         </div>
       </div>
@@ -64,7 +72,6 @@ const SearchView = () => {
   const [searchType, setSearchType] = useState('keyword');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [showPlatformDropdown, setShowPlatformDropdown] = useState(false);
 
   useEffect(() => {
     const fetchPlatforms = async () => {
@@ -118,7 +125,7 @@ const SearchView = () => {
         </div>
 
         <div className="flex gap-4">
-          <div className="flex-1 relative">
+          <div className="flex-1 relative shadow-2xl">
             <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-text-dim" size={20} />
             <input 
               type="text" 
@@ -143,11 +150,11 @@ const SearchView = () => {
 
         {/* Category filters */}
         <div className="flex gap-2 overflow-x-auto pb-2 no-scrollbar">
-          {['All', 'Study', 'Social Media', 'Communication', 'Shopping', 'Finance', 'Entertainment', 'AI Chats', 'Documents', 'Uncategorized'].map(filter => (
+          {['All', 'Study', 'Digital', 'Shopping', 'Finance', 'Personal', 'Documents', 'Duplicates', 'Uncategorized'].map(filter => (
             <button 
               key={filter}
               onClick={() => setActiveFilter(filter)}
-              className={`px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap transition-all border ${
+              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider whitespace-nowrap transition-all border ${
                 activeFilter === filter 
                   ? 'bg-primary/20 text-primary border-primary/50' 
                   : 'bg-bg-card-dark text-text-dim border-border-dark hover:text-white'
@@ -160,12 +167,12 @@ const SearchView = () => {
 
         {/* Platform filters */}
         <div className="flex gap-2 overflow-x-auto pb-2 no-scrollbar items-center">
-          <span className="text-[10px] text-text-dim font-bold uppercase tracking-widest mr-2 shrink-0">Platform:</span>
+          <span className="text-[9px] text-text-dim font-black uppercase tracking-widest mr-2 shrink-0">Platform:</span>
           {platformOptions.map(plat => (
             <button 
               key={plat}
               onClick={() => setPlatformFilter(plat)}
-              className={`px-3 py-1.5 rounded-lg text-[10px] font-bold whitespace-nowrap transition-all border ${
+              className={`px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-tighter whitespace-nowrap transition-all border ${
                 platformFilter === plat 
                   ? 'bg-indigo-500/20 text-indigo-400 border-indigo-500/40' 
                   : 'bg-bg-card-dark text-text-dim border-border-dark hover:text-white'

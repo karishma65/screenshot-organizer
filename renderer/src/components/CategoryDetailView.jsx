@@ -62,25 +62,33 @@ const RecentScreenshotCard = ({ screenshot }) => {
     <motion.div
       whileHover={{ y: -4 }}
       onClick={handleReveal}
-      className="bg-bg-card-dark border border-border-dark rounded-2xl overflow-hidden cursor-pointer group"
+      className="bg-bg-card-dark border border-border-dark rounded-2xl overflow-hidden cursor-pointer group flex flex-col"
     >
       <div className="aspect-video bg-white/5 overflow-hidden relative">
         <Thumbnail path={screenshot.organized_path || screenshot.original_path} alt={screenshot.filename} />
         <div className="absolute top-2 right-2 px-2 py-1 bg-black/60 backdrop-blur-md rounded-md text-[10px] text-white font-bold opacity-0 group-hover:opacity-100 transition-opacity uppercase tracking-wider flex items-center gap-1">
           <FolderOpen size={10} /> Reveal
         </div>
+        {screenshot.final_confidence > 0 && (
+          <div className="absolute left-2 bottom-2 px-2 py-0.5 bg-black/40 backdrop-blur-md rounded-md text-[8px] text-primary font-black uppercase tracking-tighter">
+            {Math.round(screenshot.final_confidence * 100)}% Conf
+          </div>
+        )}
       </div>
-      <div className="p-4">
+      <div className="p-4 flex-1 flex flex-col">
         <h4 className="text-sm font-bold text-white truncate mb-2">{screenshot.filename}</h4>
-        <div className="flex flex-wrap gap-2 mb-2">
+        <div className="flex flex-wrap gap-1.5 mb-3">
           {screenshot.platform && screenshot.platform !== 'UNKNOWN' && (
-            <span className="text-[9px] px-2 py-0.5 bg-indigo-500/10 text-indigo-400 rounded-full font-bold uppercase">{screenshot.platform}</span>
+            <span className="text-[8px] px-1.5 py-0.5 bg-white/5 text-text-dim border border-white/10 rounded font-black uppercase">{screenshot.platform}</span>
           )}
-          {screenshot.study_group_name && screenshot.study_group_name !== 'NONE' && screenshot.study_group_name !== 'UNSORTED' && (
-            <span className="text-[9px] px-2 py-0.5 bg-blue-500/10 text-blue-400 rounded-full font-bold uppercase">{screenshot.study_group_name}</span>
+          {screenshot.subcategory && screenshot.subcategory !== 'NONE' && (
+            <span className="text-[8px] px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded font-black uppercase">{screenshot.subcategory}</span>
+          )}
+          {screenshot.study_group_name && screenshot.study_group_name !== 'NONE' && (
+            <span className="text-[8px] px-1.5 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded font-black uppercase">{screenshot.study_group_name}</span>
           )}
         </div>
-        <div className="flex items-center gap-1 text-[10px] text-text-dim">
+        <div className="mt-auto flex items-center gap-1 text-[9px] text-text-dim font-bold uppercase tracking-tighter opacity-60">
           <Calendar size={10} />
           {screenshot.created_at ? new Date(screenshot.created_at).toLocaleDateString() : 'Unknown'}
         </div>

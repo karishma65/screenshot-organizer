@@ -6,57 +6,40 @@ const imghash = require('imghash');
 const db = require('./database');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const crypto = require('crypto');
+const bridge = require('./pythonBridge');
 
-// 7. PREVENT DUPLICATE WATCHER TRIGGERS
-const processingQueue = new Set();
-
-async function getSemanticGroup(text) {
-  return new Promise((resolve) => {
-    try {
-      const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-      const pythonProcess = spawn(pythonCmd, [
-        path.join(__dirname, '../python/analyzer.py'), 
-        'analyze_semantic',
-        text
-      ]);
-
-      let output = '';
-      pythonProcess.stdout.on('data', (data) => { output += data.toString(); });
-
-      pythonProcess.on('close', (code) => {
-        if (code !== 0 || !output.trim()) {
-          resolve('UNCATEGORIZED');
-          return;
-        }
-        try {
-          const result = JSON.parse(output);
-          resolve(result.study_group.toUpperCase() || 'UNCATEGORIZED');
-        } catch (e) {
-          resolve('UNCATEGORIZED');
-        }
-      });
-    } catch (e) {
-      resolve('UNCATEGORIZED');
-    }
+function getFileHash(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', err => reject(err));
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
   });
 }
 
-function calculateConfidence(text, platform, layout, studyGroup) {
-  let score = 0;
-  
-  // Weights:
-  // Platform Detection: 0.4
-  // Semantic Match: 0.3
-  // OCR Quality: 0.2
-  // Layout Match: 0.1
+const processingQueue = new Set();
 
-  if (platform !== 'UNKNOWN') score += 0.4;
-  if (studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') score += 0.3;
-  if (text.length > 50) score += 0.2;
-  if (layout !== 'UNKNOWN_LAYOUT' && layout !== 'DOCUMENT_LAYOUT') score += 0.1;
+async function getSemanticGroup(text) {
+  try {
+    // Correcting db access: db is the instance exported from database.js
+    const rows = await new Promise((resolve, reject) => {
+      db.all("SELECT study_group_name, ocr_text FROM screenshots WHERE main_category = 'STUDY' AND study_group_name != 'NONE' LIMIT 100", (err, rows) => {
+        if (err) resolve([]); // Fallback to empty if table doesn't exist yet
+        else resolve(rows || []);
+      });
+    });
+    
+    if (rows.length === 0) return 'NONE';
 
-  return Math.min(score, 1.0);
+    const clusters = rows.map(r => [r.study_group_name, r.ocr_text]);
+    const result = await bridge.request('semantic', { text, clusters });
+    return result || 'NONE';
+  } catch (e) {
+    console.error('Semantic Analysis Bridge Error (Recovering...):', e);
+    return 'NONE'; // CRITICAL FALLBACK: Do not stop processing
+  }
 }
 
 async function processScreenshot(filePath, mainWindow, organizedRoot) {
@@ -70,6 +53,9 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
   try {
     const fileName = path.basename(filePath);
     
+    // Ensure bridge is booted
+    await bridge.boot();
+
     await new Promise((resolve) => {
       db.run('INSERT OR IGNORE INTO screenshots (original_path, filename, processing_status) VALUES (?, ?, ?)', 
         [filePath, fileName, 'processing'], function(err) {
@@ -81,135 +67,241 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
 
     db.log('ANALYSIS_START', `Processing: ${fileName}`, 'info');
 
-    // 0. pHash & DUPLICATE DETECTION
-    let phash = 'ERROR';
-    try {
-      phash = await imghash.hash(filePath);
-    } catch (e) {
-      console.warn('pHash Failed');
-    }
-    
-    const existing = await new Promise(resolve => {
-      db.get('SELECT id, original_hash FROM screenshots WHERE (original_hash = ? OR original_path = ?) AND id != ? AND processing_status = "completed"', 
-        [phash, filePath, currentId], (err, row) => resolve(row));
-    });
+    // 0. DUPLICATE DETECTION (Two-Step)
+    let sha256 = '';
+    let phash = '';
+    let duplicateType = 'UNIQUE';
+    let duplicateOf = null;
+    let similarity = 0;
+    let cachedOcr = null;
 
-    if (existing) {
-      db.run('UPDATE screenshots SET is_duplicate = 1, duplicate_of = ?, similarity_score = 100, processing_status = "completed", main_category = "DUPLICATES" WHERE id = ?', 
-        [existing.id, currentId]);
-      db.log('DUPLICATE_DETECTED', `${fileName} is a duplicate of ${existing.id}`, 'warning');
+    try {
+      // Step 1: SHA256 (Exact)
+      sha256 = await getFileHash(filePath);
+      const exactMatch = await new Promise(resolve => {
+        db.get('SELECT id, ocr_text FROM screenshots WHERE sha256 = ? AND id != ? AND processing_status = "completed" LIMIT 1', [sha256, currentId], (err, row) => resolve(row));
+      });
+
+      if (exactMatch) {
+        duplicateType = 'EXACT_DUPLICATE';
+        duplicateOf = exactMatch.id;
+        similarity = 1.0;
+        cachedOcr = exactMatch.ocr_text;
+      } else {
+        // Step 2: pHash (Near)
+        phash = await imghash.hash(filePath);
+        const nearMatch = await new Promise(resolve => {
+          db.get('SELECT id, ocr_text FROM screenshots WHERE original_hash = ? AND id != ? AND processing_status = "completed" LIMIT 1', [phash, currentId], (err, row) => resolve(row));
+        });
+
+        if (nearMatch) {
+          duplicateType = 'NEAR_DUPLICATE';
+          duplicateOf = nearMatch.id;
+          similarity = 0.95; 
+          cachedOcr = nearMatch.ocr_text;
+        }
+      }
+    } catch (e) {
+      console.warn('Hash Calculation Failed', e);
+    }
+
+    if (duplicateOf) {
+      db.run(`
+        UPDATE screenshots SET 
+          is_duplicate = 1, 
+          duplicate_of = ?, 
+          similarity_score = ?, 
+          sha256 = ?, 
+          original_hash = ?,
+          ocr_text = ?,
+          main_category = 'DUPLICATES',
+          processing_status = 'completed' 
+        WHERE id = ?
+      `, [duplicateOf, similarity, sha256, phash, cachedOcr, currentId]);
+
+      db.log('DUPLICATE_DETECTED', `${fileName} is ${duplicateType} of ${duplicateOf} (OCR Reused)`, 'warning');
       processingQueue.delete(filePath);
       return;
     }
 
-    // 1. OCR
-    let text = '';
-    try {
-        text = await extractText(filePath);
-    } catch (e) {
-        errorMessage += `OCR Failed; `;
+    // 1. OCR (REDUCE WORK: Check if we have exact copy in the past regardless of duplicate status)
+    let text = cachedOcr;
+    if (!text) {
+      try {
+          text = await extractText(filePath);
+      } catch (e) {
+          errorMessage += `OCR Failed; `;
+          text = '';
+      }
     }
 
-    // 2. Layout Analysis (New)
+    // 2. Layout Analysis (Fast Density-based)
     let layout = 'UNKNOWN_LAYOUT';
+    let layoutConfidence = 0;
     try {
-      layout = await analyzeLayout(filePath);
+      const layoutResult = await analyzeLayout(filePath);
+      layout = layoutResult.layout;
+      layoutConfidence = layoutResult.confidence;
     } catch (e) {
       errorMessage += `Layout AI Failed; `;
     }
 
-    // 3. Platform Detection
+    // 3. Platform Detection (ENHANCED)
     let platform = 'UNKNOWN';
+    let uiConfidence = 0;
+    let digitalType = 'NONE';
     try {
-        platform = detectPlatform(text, layout).toUpperCase();
+        const detection = detectPlatform(text, layout);
+        platform = detection.platform.toUpperCase();
+        uiConfidence = detection.confidence;
+        digitalType = detection.digital_type;
     } catch (e) {
-        platform = 'UNKNOWN';
+        console.error('Platform Detection Failed:', e);
     }
 
-    // 4. Visual AI
-    let visualTags = [];
+    // 4. Visual AI (CLIP)
+    let visualResults = [];
+    let visualLabels = [];
+    let visualConfidence = 0;
     try {
-        visualTags = await classifyImage(filePath);
+        visualResults = await classifyImage(filePath);
+        visualLabels = visualResults.map(r => r.label);
+        // Take highest confidence from results if available
+        if (visualResults.length > 0) {
+            visualConfidence = visualResults[0].confidence;
+        }
     } catch (e) {
         errorMessage += `Visual AI Failed; `;
     }
 
-    // 5. Semantic Analysis
+    // 5. Semantic Analysis (Educational Candidate Filter)
     let studyGroup = 'NONE';
+    let semanticConfidence = 0;
+    
+    // Skip Study clustering for non-educational domains
+    const nonStudyDomains = ['AI_CHAT', 'COMMUNICATION', 'SOCIAL_MEDIA', 'ENTERTAINMENT', 'SHOPPING', 'FINANCE'];
+    const isEducationalCandidate = !nonStudyDomains.includes(digitalType) && text.length > 50;
+
     try {
-        if (text.length > 30) {
+        if (isEducationalCandidate) {
           studyGroup = await getSemanticGroup(text);
+          semanticConfidence = (studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') ? 0.85 : 0;
         }
     } catch (e) {
-        studyGroup = 'UNCATEGORIZED';
+        studyGroup = 'NONE';
     }
 
-    // 6. Confidence Engine
-    const confidenceScore = calculateConfidence(text, platform, layout, studyGroup);
+    // 6. Visual & Layout Confidence (Refined)
+    // layoutConfidence is now captured from analyzeLayout above.
 
-    // 7. Category Mapping (Strict Allowed Categories)
+    // 7. FINAL CONFIDENCE AGGREGATION
+    // Priority Weights: UI(0.4) > Semantic(0.3) > Documents/OCR(0.2) > Visual/Layout(0.1)
+    const ocrConfidence = Math.min(text.length / 500, 1.0) * 0.2;
+    const finalConfidence = (uiConfidence * 0.4) + (semanticConfidence * 0.3) + ocrConfidence + (visualConfidence * 0.05) + (layoutConfidence * 0.05);
+
+    // 8. CATEGORY DECISION ENGINE (Strict Precedence Order)
     let mainCategory = 'UNCATEGORIZED';
+    let subcategory = 'NONE';
     
-    // Priority Logic
-    if (['CHATGPT', 'GEMINI', 'CLAUDE', 'ANTIGRAVITY'].includes(platform)) {
-      mainCategory = 'AI CHATS';
-    } else if (['WHATSAPP', 'TELEGRAM', 'DISCORD', 'SLACK'].includes(platform) || layout === 'CHAT_LAYOUT') {
-      mainCategory = 'COMMUNICATION';
-    } else if (['AMAZON', 'FLIPKART'].includes(platform)) {
+    // 1. SHOPPING (High Priority)
+    if (digitalType === 'SHOPPING' && uiConfidence > 0.4) {
       mainCategory = 'SHOPPING';
-    } else if (['PAYTM', 'UPI', 'WALLET'].includes(platform) || text.toLowerCase().includes('payment')) {
+    } 
+    // 2. FINANCE (High Priority)
+    else if (digitalType === 'FINANCE' && uiConfidence > 0.4) {
       mainCategory = 'FINANCE';
-    } else if (['NETFLIX', 'YOUTUBE'].includes(platform)) {
-      mainCategory = 'ENTERTAINMENT';
-    } else if (['INSTAGRAM', 'FACEBOOK', 'LINKEDIN'].includes(platform)) {
-      mainCategory = 'SOCIAL MEDIA';
-    } else if (studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') {
-      mainCategory = 'STUDY';
-    } else if (text.length > 200 || layout === 'DOCUMENT_LAYOUT') {
+    }
+    // 3. DIGITAL (AI, Social, Comm, Ent) - Platform Overrides Layout
+    else if (digitalType !== 'NONE') {
+      mainCategory = 'DIGITAL';
+      subcategory = digitalType;
+    }
+    // 4. DOCUMENTS (Before Study)
+    else if (layout === 'DOCUMENT_LAYOUT' || text.length > 350 || visualLabels.includes('document')) {
       mainCategory = 'DOCUMENTS';
     }
-
-    // THRESHOLD CHECK: Force to UNCATEGORIZED if confidence is low
-    if (confidenceScore < 0.40) {
-      mainCategory = 'UNCATEGORIZED';
+    // 5. STUDY
+    else if (studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED' && semanticConfidence > 0.5) {
+      mainCategory = 'STUDY';
+    }
+    // 6. PERSONAL
+    else if (visualLabels.includes('human_photo') || visualLabels.includes('animal_photo')) {
+      mainCategory = 'PERSONAL';
     }
 
-    // 8. PHYSICAL ORGANIZATION
+    // THRESHOLD SAFETY: Fallback if everything is weak
+    if (finalConfidence < 0.25 && mainCategory !== 'DUPLICATES') {
+      mainCategory = 'UNCATEGORIZED';
+      subcategory = 'NONE';
+    }
+
+    // 9. METADATA UPDATES
+    const ui_conf = uiConfidence;
+    const semantic_conf = semanticConfidence;
+    const layout_conf = layoutConfidence;
+    const visual_conf = visualConfidence;
+    const final_conf = finalConfidence;
+
+    // 8. PHYSICAL ORGANIZATION (Strict Folder Rules)
     let organizedDir = path.join(organizedRoot, mainCategory);
+    
+    // Dynamic Sub-folders ONLY for STUDY
     if (mainCategory === 'STUDY' && studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') {
       organizedDir = path.join(organizedDir, studyGroup);
     }
 
-    if (!fs.existsSync(organizedDir)) {
-      fs.mkdirSync(organizedDir, { recursive: true });
-    }
-    
-    const destPath = path.join(organizedDir, fileName);
-    fs.copyFileSync(filePath, destPath);
+      if (!fs.existsSync(organizedDir)) {
+        fs.mkdirSync(organizedDir, { recursive: true });
+      }
+      
+      const destPath = path.join(organizedDir, fileName);
+      fs.copyFileSync(filePath, destPath);
+      db.log('PHYSICAL_MOVE', `${fileName} moved to ${mainCategory}`, 'success');
 
-    // 9. DB SAVE
+      // 10. Generate and Cache Semantic Embedding
+    let embeddingBlob = null;
+    try {
+      if (text && text.length > 10) {
+        const embedding = await bridge.request('embedding', { text: text.substring(0, 1000) });
+        if (embedding) {
+          embeddingBlob = Buffer.from(new Float32Array(embedding).buffer);
+        }
+      }
+    } catch (e) {
+      console.error('Embedding Generation Failed:', e);
+    }
+
+    // 11. DB SAVE (Full Metadata + Cache)
     db.run(`
       UPDATE screenshots SET 
         original_path = ?, organized_path = ?, filename = ?, ocr_text = ?, 
-        main_category = ?, platform = ?, content_types = ?, 
-        original_hash = ?, study_group_name = ?, tags = ?,
-        processing_status = 'completed', confidence_score = ?, error_message = ?
+        main_category = ?, subcategory = ?, platform = ?, 
+        study_group_name = ?, layout_type = ?, content_types = ?, 
+        original_hash = ?, ui_confidence = ?, semantic_confidence = ?,
+        visual_confidence = ?, layout_confidence = ?, final_confidence = ?,
+        text_embedding = ?,
+        processing_status = 'completed', error_message = ?
       WHERE id = ?
     `, [
       filePath, destPath, fileName, text,
-      mainCategory, platform, JSON.stringify(visualTags),
-      phash, studyGroup, layout,
-      confidenceScore, errorMessage || null,
+      mainCategory, subcategory, platform,
+      studyGroup, layout, JSON.stringify(visualLabels),
+      phash, ui_conf, semantic_conf,
+      visual_conf, layout_conf, final_conf,
+      embeddingBlob,
+      errorMessage || null,
       currentId
     ], (err) => {
+      if (err) db.log('DB_ERROR', `Failed to update ${fileName}: ${err.message}`, 'error');
       const { ipcMain } = require('electron');
       ipcMain.emit('force-stats-update');
     });
 
-    db.log('CATEGORIZED', `${fileName} → ${mainCategory} (${Math.round(confidenceScore * 100)}% conf)`, 'success');
+    db.log('CATEGORIZED', `${fileName} → ${mainCategory} (${Math.round(finalConfidence * 100)}% conf)`, 'success');
 
   } catch (error) {
     console.error('Pipeline Crash:', error);
+    db.log('PIPELINE_CRASH', `Fatal error on ${path.basename(filePath)}: ${error.message}`, 'error');
     if (currentId) {
       db.run('UPDATE screenshots SET processing_status = "failed", error_message = ? WHERE id = ?', [error.message, currentId]);
     }

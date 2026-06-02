@@ -13,7 +13,10 @@ import {
   FolderOpen,
   Inbox,
   Loader2,
-  AlertCircle
+  AlertCircle,
+  User,
+  CreditCard,
+  FileText
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import CategoryDetailView from './CategoryDetailView';
@@ -102,10 +105,12 @@ const CategoriesView = () => {
 
   const categories = [
     { icon: BookOpen, label: 'Study', count: counts['STUDY'] || 0, color: 'bg-blue-600', dbKey: 'STUDY' },
-    { icon: Share2, label: 'Social Media', count: counts['SOCIAL MEDIA'] || 0, color: 'bg-primary', dbKey: 'SOCIAL MEDIA' },
-    { icon: MessageSquare, label: 'Communication', count: counts['COMMUNICATION'] || 0, color: 'bg-emerald-600', dbKey: 'COMMUNICATION' },
+    { icon: LayoutGrid, label: 'Digital', count: counts['DIGITAL'] || 0, color: 'bg-primary', dbKey: 'DIGITAL' },
     { icon: ShoppingBag, label: 'Shopping', count: counts['SHOPPING'] || 0, color: 'bg-orange-600', dbKey: 'SHOPPING' },
-    { icon: Bot, label: 'AI Chats', count: counts['AI CHATS'] || 0, color: 'bg-indigo-600', dbKey: 'AI CHATS' },
+    { icon: CreditCard, label: 'Finance', count: counts['FINANCE'] || 0, color: 'bg-emerald-600', dbKey: 'FINANCE' },
+    { icon: User, label: 'Personal', count: counts['PERSONAL'] || 0, color: 'bg-rose-600', dbKey: 'PERSONAL' },
+    { icon: FileText, label: 'Documents', count: counts['DOCUMENTS'] || 0, color: 'bg-cyan-600', dbKey: 'DOCUMENTS' },
+    { icon: Copy, label: 'Duplicates', count: counts['DUPLICATES'] || 0, color: 'bg-indigo-600', dbKey: 'DUPLICATES' },
     { icon: Files, label: 'Uncategorized', count: counts['UNCATEGORIZED'] || 0, color: 'bg-gray-600', dbKey: 'UNCATEGORIZED' },
   ];
 

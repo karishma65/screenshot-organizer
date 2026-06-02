@@ -7,9 +7,37 @@ from collections import Counter
 import cv2
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
+import torch
+import clip
+from PIL import Image
 
 # Initialize models
 model = SentenceTransformer('all-MiniLM-L6-v2')
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model, preprocess = clip.load("ViT-B/32", device=device)
+
+# CLIP Labels for zero-shot classification
+VISUAL_LABELS = [
+    "a diagram or chart",
+    "a document or paper",
+    "a code editor with syntax highlighting",
+    "a website or webpage",
+    "an anime scene",
+    "a movie scene or cinematic shot",
+    "a photo of a person",
+    "a photo of an animal"
+]
+
+LABEL_MAPPING = {
+    "a diagram or chart": "diagram",
+    "a document or paper": "document",
+    "a code editor with syntax highlighting": "code_editor",
+    "a website or webpage": "website",
+    "an anime scene": "anime",
+    "a movie scene or cinematic shot": "movie_scene",
+    "a photo of a person": "human_photo",
+    "a photo of an animal": "animal_photo"
+}
 
 DB_PATH = os.path.join(os.path.dirname(__file__), '../data/metadata.db')
 
@@ -27,49 +55,55 @@ def extract_dominant_terms(text):
 
 def analyze_layout(image_path):
     """
-    Detects layout type using OpenCV heuristics.
+    Fast layout detection using pixel density and projections.
+    Suitable for 5000+ screenshots.
     """
     if not os.path.exists(image_path):
-        return "UNKNOWN"
+        return "UNKNOWN_LAYOUT", 0
         
-    img = cv2.imread(image_path)
-    if img is None:
-        return "UNKNOWN"
-        
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    
-    # 1. Detect Chat Layout (Message avatars/bubbles on sides)
-    # 2. Detect Code Layout (High indentation diversity, specific punctuation)
-    # 3. Detect Flowchart/Diagram (High edge connectivity, shapes)
-    
-    # Heuristic for Code: High vertical alignment on specific columns
-    # Heuristic for Chat: Specific aspect ratios for contours (bubbles)
-    
-    height, width = gray.shape
-    
-    # Simple Layout Logic
-    # Chat: Look for repeated small contours on left/right
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    bubble_count = 0
-    code_indentation = 0
-    shapes_count = 0
-    
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        aspect_ratio = float(w)/h
-        if 50 < h < 200 and aspect_ratio > 1.5:
-            bubble_count += 1
-        if w > 100 and h > 100:
-            shapes_count += 1
+    try:
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return "UNKNOWN_LAYOUT", 0
             
-    if bubble_count > 4:
-        return "CHAT_LAYOUT"
-    if shapes_count > 5:
-        return "DIAGRAM_LAYOUT"
+        h, w = img.shape
+        # Threshold to binary for density analysis
+        _, binary = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY_INV)
         
-    return "DOCUMENT_LAYOUT"
+        # 1. Calculate Densities
+        total_pixels = h * w
+        ink_pixels = np.count_nonzero(binary)
+        density = ink_pixels / total_pixels
+        
+        # 2. Projections (Vertical & Horizontal)
+        v_proj = np.sum(binary, axis=0) / 255
+        h_proj = np.sum(binary, axis=1) / 255
+        
+        # Blank lines (Whitespace distribution)
+        blank_rows = np.where(h_proj < (w * 0.02))[0]
+        row_variance = np.var(np.diff(blank_rows)) if len(blank_rows) > 5 else 0
+        
+        # 3. Decision Logic
+        # PHOTO: Very high density or very scattered ink (no clear lines)
+        if density > 0.4:
+            return "PHOTO_LAYOUT", 0.8
+            
+        # CODE: High vertical alignment on the left (indentation)
+        left_density = np.sum(v_proj[:int(w*0.2)])
+        if left_density > (np.sum(v_proj) * 0.4) and len(blank_rows) > 20:
+            return "CODE_LAYOUT", 0.9
+            
+        # CHAT: Evenly spaced horizontal blocks with gaps
+        if 5 < len(blank_rows) < 50 and row_variance < 100:
+            return "CHAT_LAYOUT", 0.85
+            
+        # DIAGRAM: Low density, scattered projections
+        if 0.01 < density < 0.08:
+            return "DIAGRAM_LAYOUT", 0.75
+            
+        return "DOCUMENT_LAYOUT", 0.7
+    except:
+        return "UNKNOWN_LAYOUT", 0
 
 def semantic_search(query):
     """
@@ -106,32 +140,35 @@ def semantic_search(query):
     return results
 
 def analyze_semantic(text):
-    if not text or len(text.strip()) < 15:
-        return "GENERAL_NOTES"
+    if not text or len(text.strip()) < 20:
+        return "NONE"
 
     clusters = []
     if os.path.exists(DB_PATH):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT study_group_name, GROUP_CONCAT(ocr_text, ' ') 
-            FROM (
-                SELECT study_group_name, ocr_text 
-                FROM screenshots 
-                WHERE main_category = 'STUDY' AND study_group_name IS NOT NULL
-                ORDER BY created_at DESC
-            ) 
-            GROUP BY study_group_name
-        """)
-        clusters = cursor.fetchall()
-        conn.close()
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT study_group_name, GROUP_CONCAT(ocr_text, ' ') 
+                FROM (
+                    SELECT study_group_name, ocr_text 
+                    FROM screenshots 
+                    WHERE main_category = 'STUDY' AND study_group_name IS NOT NULL AND study_group_name != 'NONE'
+                    ORDER BY created_at DESC
+                ) 
+                GROUP BY study_group_name
+            """)
+            clusters = cursor.fetchall()
+            conn.close()
+        except:
+            pass
+
+    if not clusters:
+        # We no longer auto-create clusters from random text.
+        # This prevents fragmentation.
+        return "NONE"
 
     query_embedding = model.encode(text, convert_to_tensor=True)
-    
-    if not clusters:
-        new_name = (extract_dominant_terms(text) or "STUDY_CLUSTER_1").upper()
-        return new_name
-
     cluster_names = [c[0] for c in clusters]
     cluster_texts = [c[1] if c[1] else c[0] for c in clusters]
     cluster_embeddings = model.encode(cluster_texts, convert_to_tensor=True)
@@ -140,11 +177,45 @@ def analyze_semantic(text):
     best_match_idx = int(cosine_scores.argmax())
     best_score = float(cosine_scores[best_match_idx])
     
-    if best_score > 0.50:
+    # Strictly conservative threshold (Prefer 0.80)
+    if best_score >= 0.80:
         return cluster_names[best_match_idx].upper()
-    else:
-        term_name = extract_dominant_terms(text)
-        return (term_name if term_name else f"STUDY_CLUSTER_{len(clusters) + 1}").upper()
+    
+    return "NONE"
+
+def analyze_visual(image_path):
+    if not os.path.exists(image_path):
+        return []
+    
+    try:
+        image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
+        # We need to compute text features for labels
+        text_inputs = clip.tokenize(VISUAL_LABELS).to(device)
+
+        with torch.no_grad():
+            image_features = clip_model.encode_image(image)
+            text_features = clip_model.encode_text(text_inputs)
+            
+            # Normalize
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            
+            # Similarity
+            similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+            probs = similarity.cpu().numpy()[0]
+
+        results = []
+        for i, prob in enumerate(probs):
+            if prob > 0.20: # Confidence threshold for CLIP
+                results.append({
+                    "label": LABEL_MAPPING[VISUAL_LABELS[i]],
+                    "confidence": float(prob)
+                })
+        
+        return sorted(results, key=lambda x: x['confidence'], reverse=True)
+    except Exception as e:
+        print(f"CLIP ERROR: {e}")
+        return []
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -156,13 +227,18 @@ if __name__ == "__main__":
         
     elif mode == "analyze_layout":
         img_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        layout = analyze_layout(img_path)
-        print(json.dumps({"layout": layout}))
+        layout, confidence = analyze_layout(img_path)
+        print(json.dumps({"layout": layout, "confidence": confidence}))
         
     elif mode == "analyze_semantic":
         text_input = sys.argv[2] if len(sys.argv) > 2 else ""
         result = analyze_semantic(text_input)
         print(json.dumps({"study_group": result}))
+    
+    elif mode == "analyze_visual":
+        img_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        results = analyze_visual(img_path)
+        print(json.dumps(results))
     
     else:
         # Backward compatibility
