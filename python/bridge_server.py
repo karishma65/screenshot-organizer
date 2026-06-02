@@ -8,40 +8,12 @@ from sentence_transformers import SentenceTransformer, util
 import cv2
 import numpy as np
 
-# Load models WITH error handling for network‑resilient startup
+# Load models ONCE at startup
 print("BRIDGE_STARTING", flush=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-clip_model = None
-semantic_model = None
-
-# 1. Load CLIP (Visual AI) – optional, continue if unavailable
-try:
-    print("AI_LOADING: CLIP Processing Engine...", flush=True)
-    clip_model, preprocess = clip.load("ViT-B/32", device=device)
-    print("AI_LOAD_SUCCESS: CLIP Visual Engine Online", flush=True)
-except Exception as e:
-    print(f"AI_LOAD_FAIL: CLIP Visual Engine Offline - {str(e)}", flush=True)
-
-# 2. Load SentenceTransformer (Semantic AI) – prefer local cache, avoid network download
-try:
-    print("AI_LOADING: Semantic Embedding Engine...", flush=True)
-    # First try loading from local cache only
-    try:
-        semantic_model = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
-        print("AI_LOAD_SUCCESS: Semantic Engine Loaded from cache", flush=True)
-    except Exception:
-        # Fallback to normal load (may download) – but keep it optional
-        semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-        print("AI_LOAD_SUCCESS: Semantic Engine Online (downloaded)", flush=True)
-except Exception as e:
-    print(f"AI_LOAD_FAIL: Semantic Engine Offline - {str(e)}", flush=True)
-    semantic_model = None
-
-# Final startup status report
-print(f"CLIP Loaded: {'YES' if clip_model else 'NO'}", flush=True)
-print(f"Semantic Model Loaded: {'YES' if semantic_model else 'NO'}", flush=True)
-print("Layout Analyzer Loaded: YES", flush=True)
+clip_model, preprocess = clip.load("ViT-B/32", device=device)
+semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 VISUAL_LABELS = [
     "a diagram or chart",
