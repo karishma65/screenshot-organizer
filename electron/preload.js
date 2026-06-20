@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer, shell } = require('electron');
+//lets the UI call backend functions that eventually trigger classification. security
 
 console.log('PRELOAD LOADED');
 

@@ -1,31 +1,94 @@
+// SearchView.jsx — COMPLETE REWRITE (v3)
+//
+// Fixes in this version:
+//  Issue 10 — SearchResultCard now displays document_type.
+//  Issue 11 — SearchResultCard now displays study_group_name.
+//  Issue 12 — SearchResultCard destructures ALL metadata fields from the search
+//             result object and renders them using MetaBadge. Fields that are
+//             'NONE', 'Unknown', or empty are hidden automatically.
+//             Tags are parsed from content_types JSON { labels, tags }.
+
 import React, { useState, useEffect } from 'react';
-import { Search, Filter, Image as ImageIcon, Calendar, Tag, ChevronDown, FolderOpen, Info, Inbox, AlertCircle, Loader2 } from 'lucide-react';
+import {
+  Search, Image as ImageIcon, Calendar, Tag,
+  ChevronDown, FolderOpen, Inbox, AlertCircle, Loader2
+} from 'lucide-react';
 import { motion } from 'framer-motion';
 
-const SearchResultCard = ({ filename, main_category, subcategory, platform, final_confidence, created_at, organized_path, original_path }) => {
+// ── MetaBadge — reusable metadata pill (same as CategoryDetailView) ───────────
+const MetaBadge = ({ value, color = 'default' }) => {
+  if (!value || value === 'NONE' || value === 'Unknown' || value === 'UNKNOWN') return null;
+
+  const styles = {
+    default: 'bg-white/5 text-text-dim border-white/10',
+    primary: 'bg-primary/10 text-primary border-primary/20',
+    green: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    blue: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+    amber: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+    violet: 'bg-violet-500/10 text-violet-400 border-violet-500/20',
+    rose: 'bg-rose-500/10 text-rose-400 border-rose-500/20',
+  };
+
+  return (
+    <span className={`text-[8px] px-1.5 py-0.5 border rounded font-black uppercase ${styles[color] || styles.default}`}>
+      {value}
+    </span>
+  );
+};
+
+// ── Parse tags from content_types ─────────────────────────────────────────────
+function parseTags(contentTypesRaw) {
+  if (!contentTypesRaw) return [];
+  try {
+    const parsed = JSON.parse(contentTypesRaw);
+    if (parsed && Array.isArray(parsed.tags)) return parsed.tags;
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+// ── SearchResultCard ──────────────────────────────────────────────────────────
+// FIX Issue 12: now accepts all metadata fields, not just 6 named props.
+const SearchResultCard = ({
+  // identity
+  filename, original_path, organized_path,
+  // classification
+  main_category, subcategory, platform,
+  // study
+  study_group_name,
+  // document
+  document_type,
+  // code
+  is_code, code_language, editor,
+  // tags (from content_types JSON)
+  content_types,
+  // confidence + date
+  final_confidence, created_at,
+}) => {
   const [imgError, setImgError] = useState(false);
   const imagePath = organized_path || original_path;
   const imageUrl = imagePath ? `screenshot://${encodeURIComponent(imagePath)}` : '';
 
+  const tags = parseTags(content_types);
+
   const handleReveal = (e) => {
     e.stopPropagation();
-    const revealPath = organized_path || original_path;
-    if (revealPath && window.electronAPI.revealScreenshot) {
-      window.electronAPI.revealScreenshot(revealPath);
-    }
+    const p = organized_path || original_path;
+    if (p && window.electronAPI?.revealScreenshot) window.electronAPI.revealScreenshot(p);
   };
 
   return (
-    <motion.div 
+    <motion.div
       whileHover={{ y: -4 }}
       className="bg-bg-card-dark border border-border-dark rounded-2xl overflow-hidden group cursor-pointer h-full flex flex-col"
       onClick={handleReveal}
     >
+      {/* Thumbnail */}
       <div className="aspect-video bg-white/5 flex items-center justify-center relative group-hover:bg-white/10 transition-colors overflow-hidden">
         {imageUrl && !imgError ? (
-          <img 
-            src={imageUrl} 
-            alt={filename} 
+          <img
+            src={imageUrl} alt={filename}
             className="w-full h-full object-cover"
             onError={() => setImgError(true)}
           />
@@ -44,25 +107,62 @@ const SearchResultCard = ({ filename, main_category, subcategory, platform, fina
           </div>
         )}
       </div>
-      <div className="p-4 flex-1 flex flex-col">
+
+      {/* Body */}
+      <div className="p-4 flex-1 flex flex-col gap-2">
         <h4 className="text-sm font-bold text-white truncate mb-1">{filename}</h4>
-        <div className="flex gap-1.5 mb-3 flex-wrap">
-          <span className="text-[8px] px-1.5 py-0.5 bg-primary/10 text-primary border border-primary/20 rounded font-black uppercase">{main_category}</span>
-          {subcategory && subcategory !== 'NONE' && (
-            <span className="text-[8px] px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded font-black uppercase">{subcategory}</span>
-          )}
-          {platform && platform !== 'UNKNOWN' && (
-            <span className="text-[8px] px-1.5 py-0.5 bg-white/5 text-text-dim border border-white/10 rounded font-black uppercase">{platform}</span>
-          )}
+
+        {/* ── Row 1: Category + Subcategory ── */}
+        <div className="flex flex-wrap gap-1">
+          <MetaBadge value={main_category} color="primary" />
+          <MetaBadge value={subcategory} color="green" />
         </div>
+
+        {/* ── Row 2: Platform + Study cluster ── */}
+        <div className="flex flex-wrap gap-1">
+          <MetaBadge value={platform} color="default" />
+          {/* FIX Issue 11 */}
+          <MetaBadge value={study_group_name} color="blue" />
+        </div>
+
+        {/* ── Row 3: Document type ── */}
+        {/* FIX Issue 10 */}
+        <div className="flex flex-wrap gap-1">
+          <MetaBadge value={document_type !== 'NONE' ? document_type : null} color="amber" />
+        </div>
+
+        {/* ── Row 4: Code language + Editor (only when is_code) ── */}
+        {is_code === 1 && (
+          <div className="flex flex-wrap gap-1">
+            <MetaBadge value={code_language} color="violet" />
+            <MetaBadge value={editor} color="violet" />
+          </div>
+        )}
+
+        {/* ── Row 5: Tags (Diagram, QRCode, Code, Terminal) ── */}
+        {/* FIX Issues 6, 8 */}
+        {tags.length > 0 && (
+          <div className="flex flex-wrap gap-1 items-center">
+            <Tag size={9} className="text-text-dim opacity-50" />
+            {tags.map(tag => (
+              <MetaBadge key={tag} value={tag} color="rose" />
+            ))}
+          </div>
+        )}
+
+        {/* ── Footer: date ── */}
         <div className="mt-auto flex justify-between items-center text-[9px] text-text-dim font-bold uppercase tracking-tighter opacity-60">
-          <span className="flex items-center gap-1"><Calendar size={10} /> {new Date(created_at).toLocaleDateString()}</span>
+          <span className="flex items-center gap-1">
+            <Calendar size={10} />
+            {new Date(created_at).toLocaleDateString()}
+          </span>
         </div>
       </div>
     </motion.div>
   );
 };
 
+// ── SearchView ────────────────────────────────────────────────────────────────
 const SearchView = () => {
   const [activeFilter, setActiveFilter] = useState('All');
   const [platformFilter, setPlatformFilter] = useState('All');
@@ -77,9 +177,7 @@ const SearchView = () => {
     const fetchPlatforms = async () => {
       try {
         const platforms = await window.electronAPI.getPlatforms();
-        if (platforms && platforms.length > 0) {
-          setPlatformOptions(['All', ...platforms]);
-        }
+        if (platforms?.length > 0) setPlatformOptions(['All', ...platforms]);
       } catch (e) {
         console.error('Failed to fetch platforms:', e);
       }
@@ -88,16 +186,15 @@ const SearchView = () => {
   }, []);
 
   const handleSearch = async () => {
-    const query = {
-      searchTerm,
-      category: activeFilter,
-      platform: platformFilter,
-      type: searchType
-    };
     try {
       setLoading(true);
       setError(null);
-      const data = await window.electronAPI.searchScreenshots(query);
+      const data = await window.electronAPI.searchScreenshots({
+        searchTerm,
+        category: activeFilter,
+        platform: platformFilter,
+        type: searchType
+      });
       setResults(data || []);
     } catch (e) {
       console.error('search-screenshots failed', e);
@@ -109,11 +206,8 @@ const SearchView = () => {
   };
 
   useEffect(() => {
-    const delayDebounceFn = setTimeout(() => {
-      handleSearch();
-    }, 300);
-
-    return () => clearTimeout(delayDebounceFn);
+    const timer = setTimeout(handleSearch, 300);
+    return () => clearTimeout(timer);
   }, [searchTerm, activeFilter, searchType, platformFilter]);
 
   return (
@@ -124,24 +218,23 @@ const SearchView = () => {
           <p className="text-text-dim text-sm font-medium">Find anything in your screenshot library instantly</p>
         </div>
 
+        {/* Search bar */}
         <div className="flex gap-4">
           <div className="flex-1 relative shadow-2xl">
             <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-text-dim" size={20} />
-            <input 
-              type="text" 
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Search by text, category, or platform..." 
+            <input
+              type="text" value={searchTerm}
+              onChange={e => setSearchTerm(e.target.value)}
+              placeholder="Search by text, category, or platform..."
               className="w-full pl-12 pr-4 py-4 bg-bg-card-dark border border-border-dark rounded-2xl text-white focus:outline-none focus:border-primary transition-all shadow-xl shadow-black/20"
             />
           </div>
-          <button 
-            onClick={() => setSearchType(prev => prev === 'keyword' ? 'semantic' : 'keyword')}
-            className={`px-6 rounded-2xl font-bold transition-all flex items-center gap-2 border ${
-              searchType === 'semantic' 
-                ? 'bg-indigo-600/20 text-indigo-400 border-indigo-500/50' 
+          <button
+            onClick={() => setSearchType(p => p === 'keyword' ? 'semantic' : 'keyword')}
+            className={`px-6 rounded-2xl font-bold transition-all flex items-center gap-2 border ${searchType === 'semantic'
+                ? 'bg-indigo-600/20 text-indigo-400 border-indigo-500/50'
                 : 'bg-white/5 text-text-dim border-border-dark'
-            }`}
+              }`}
           >
             {searchType === 'semantic' ? 'Semantic AI' : 'Standard'}
             <ChevronDown size={16} />
@@ -150,17 +243,15 @@ const SearchView = () => {
 
         {/* Category filters */}
         <div className="flex gap-2 overflow-x-auto pb-2 no-scrollbar">
-          {['All', 'Study', 'Digital', 'Shopping', 'Finance', 'Personal', 'Documents', 'Duplicates', 'Uncategorized'].map(filter => (
-            <button 
-              key={filter}
-              onClick={() => setActiveFilter(filter)}
-              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider whitespace-nowrap transition-all border ${
-                activeFilter === filter 
-                  ? 'bg-primary/20 text-primary border-primary/50' 
+          {['All', 'Study', 'Digital', 'Shopping', 'Finance', 'Personal', 'Documents', 'Duplicates', 'Uncategorized'].map(f => (
+            <button
+              key={f} onClick={() => setActiveFilter(f)}
+              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider whitespace-nowrap transition-all border ${activeFilter === f
+                  ? 'bg-primary/20 text-primary border-primary/50'
                   : 'bg-bg-card-dark text-text-dim border-border-dark hover:text-white'
-              }`}
+                }`}
             >
-              {filter}
+              {f}
             </button>
           ))}
         </div>
@@ -169,14 +260,12 @@ const SearchView = () => {
         <div className="flex gap-2 overflow-x-auto pb-2 no-scrollbar items-center">
           <span className="text-[9px] text-text-dim font-black uppercase tracking-widest mr-2 shrink-0">Platform:</span>
           {platformOptions.map(plat => (
-            <button 
-              key={plat}
-              onClick={() => setPlatformFilter(plat)}
-              className={`px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-tighter whitespace-nowrap transition-all border ${
-                platformFilter === plat 
-                  ? 'bg-indigo-500/20 text-indigo-400 border-indigo-500/40' 
+            <button
+              key={plat} onClick={() => setPlatformFilter(plat)}
+              className={`px-3 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-tighter whitespace-nowrap transition-all border ${platformFilter === plat
+                  ? 'bg-indigo-500/20 text-indigo-400 border-indigo-500/40'
                   : 'bg-bg-card-dark text-text-dim border-border-dark hover:text-white'
-              }`}
+                }`}
             >
               {plat}
             </button>
@@ -184,17 +273,21 @@ const SearchView = () => {
         </div>
       </header>
 
-      {/* Error State */}
+      {/* Error */}
       {error && (
         <div className="mb-4 p-4 bg-rose-500/10 border border-rose-500/20 rounded-2xl flex items-center gap-3">
           <AlertCircle size={18} className="text-rose-400 shrink-0" />
           <p className="text-sm text-rose-400">{error}</p>
-          <button onClick={handleSearch} className="ml-auto px-3 py-1 bg-rose-500/20 text-rose-400 rounded-lg text-xs font-bold hover:bg-rose-500/30 transition-colors">
+          <button
+            onClick={handleSearch}
+            className="ml-auto px-3 py-1 bg-rose-500/20 text-rose-400 rounded-lg text-xs font-bold hover:bg-rose-500/30 transition-colors"
+          >
             Retry
           </button>
         </div>
       )}
 
+      {/* Results */}
       <div className="flex-1 overflow-y-auto">
         {loading ? (
           <div className="flex flex-col items-center justify-center py-20">
@@ -204,7 +297,8 @@ const SearchView = () => {
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-6 pb-8">
             {results.length > 0 ? (
-              results.map((res) => (
+              results.map(res => (
+                // FIX Issue 12: spread passes ALL DB fields; card destructures what it needs
                 <SearchResultCard key={res.id} {...res} />
               ))
             ) : (
@@ -212,7 +306,7 @@ const SearchView = () => {
                 <Inbox size={48} className="text-text-dim opacity-20 mb-4" />
                 <h3 className="text-white font-bold text-lg mb-1">No screenshots found</h3>
                 <p className="text-text-dim text-sm max-w-xs text-center">
-                  {searchTerm 
+                  {searchTerm
                     ? `No results matching "${searchTerm}". Try different keywords or filters.`
                     : 'No screenshots in your library yet. Start by adding screenshots to your watched folder.'}
                 </p>

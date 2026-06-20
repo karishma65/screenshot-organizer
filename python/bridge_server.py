@@ -1,3 +1,4 @@
+#python side 
 import sys
 import json
 import os
@@ -7,38 +8,85 @@ from PIL import Image
 from sentence_transformers import SentenceTransformer, util
 import cv2
 import numpy as np
-
-# Load models ONCE at startup
+#Receive request from Node.js, Call correct AI function ,Return result
+# Load models WITH error handling for network-resilient startup
 print("BRIDGE_STARTING", flush=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-clip_model, preprocess = clip.load("ViT-B/32", device=device)
-semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+clip_model = None
+preprocess = None
+semantic_model = None
+
+# 1. Load CLIP (Visual AI)
+try:
+    print("AI_LOADING: CLIP Processing Engine...", flush=True)
+    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+    print("AI_LOAD_SUCCESS: CLIP Visual Engine Online", flush=True)
+except Exception as e:
+    print(f"AI_LOAD_FAIL: CLIP Visual Engine Offline - {str(e)}", flush=True)
+
+# 2. Load SentenceTransformer (Semantic AI)
+try:
+    print("AI_LOADING: Semantic Embedding Engine...", flush=True)
+    # Prefer local loading to avoid network issues
+    try:
+        semantic_model = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
+    except:
+        semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+    print("AI_LOAD_SUCCESS: Semantic Engine Online", flush=True)
+except Exception as e:
+    print(f"AI_LOAD_FAIL: Semantic Engine Offline - {str(e)}", flush=True)
+    semantic_model = None
+
+# Startup Status Logs (Required Format)
+print(f"CLIP Loaded: {'YES' if clip_model else 'NO'}", flush=True)
+print(f"Semantic Model Loaded: {'YES' if semantic_model else 'NO'}", flush=True)
+print("Layout Analyzer Loaded: YES", flush=True)
 
 VISUAL_LABELS = [
-    "a diagram or chart",
-    "a document or paper",
-    "a code editor with syntax highlighting",
-    "a website or webpage",
-    "an anime scene",
-    "a movie scene or cinematic shot",
     "a photo of a person",
-    "a photo of an animal"
+    "a photo of an animal",
+    "a diagram, flowchart or technical illustration",
+    "a statistical graph or chart",
+    "a code editor with syntax highlighting",
+    "a website or browser webpage",
+    "a document or paper",
+    "a square QR code",
+    "a mobile chat application",
+    "a shopping app product page",
+    "a payment or banking screen",
+    "a social media feed with images and text",
+    "a video streaming app",
+    "a presentation slide",
+    "a page from a book",
+    "a digital PDF page",
+    "a movie scene or cinematic shot",
+    "an anime or japanese animation scene"
 ]
 
 LABEL_MAPPING = {
-    "a diagram or chart": "diagram",
-    "a document or paper": "document",
-    "a code editor with syntax highlighting": "code_editor",
-    "a website or webpage": "website",
-    "an anime scene": "anime",
-    "a movie scene or cinematic shot": "movie_scene",
     "a photo of a person": "human_photo",
-    "a photo of an animal": "animal_photo"
+    "a photo of an animal": "animal_photo",
+    "a diagram, flowchart or technical illustration": "diagram",
+    "a statistical graph or chart": "graph",
+    "a code editor with syntax highlighting": "code_editor",
+    "a website or browser webpage": "website",
+    "a document or paper": "document",
+    "a square QR code": "qr_code",
+    "a mobile chat application": "chat_app",
+    "a shopping app product page": "shopping_app",
+    "a payment or banking screen": "payment_app",
+    "a social media feed with images and text": "social_media_feed",
+    "a video streaming app": "video_streaming_app",
+    "a presentation slide": "presentation_slide",
+    "a page from a book": "book_page",
+    "a digital PDF page": "pdf_page",
+    "a movie scene or cinematic shot": "movie_scene",
+    "an anime or japanese animation scene": "anime"
 }
 
 def analyze_visual(image_path):
-    if not os.path.exists(image_path): return []
+    if not clip_model or not preprocess or not os.path.exists(image_path): return []
     try:
         image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
         text_inputs = clip.tokenize(VISUAL_LABELS).to(device)
@@ -78,7 +126,7 @@ def analyze_layout(image_path):
     except: return "UNKNOWN_LAYOUT", 0
 
 def analyze_semantic(text_input, clusters):
-    if not text_input or not clusters: return "NONE"
+    if not semantic_model or not text_input or not clusters: return "NONE"
     try:
         query_embedding = semantic_model.encode(text_input, convert_to_tensor=True)
         cluster_names = [c[0] for c in clusters]
@@ -92,7 +140,7 @@ def analyze_semantic(text_input, clusters):
     except: return "NONE"
 
 def get_embedding(text):
-    if not text: return []
+    if not semantic_model or not text: return []
     try:
         embedding = semantic_model.encode(text).tolist()
         return embedding

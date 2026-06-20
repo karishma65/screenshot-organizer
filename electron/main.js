@@ -1,7 +1,11 @@
-const { app, BrowserWindow, ipcMain, protocol, shell, dialog } = require('electron');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
+//. It manages application startup, window creation, IPC communication, search APIs, 
+// duplicate management, settings, rebuild operations, dashboard updates, and watcher initialization.
+const { app, BrowserWindow, ipcMain, protocol, shell, dialog } = require('electron');   // instead of getting whole electron modules we are destructuring  so we dont need to do electron.app 
+// path,fs,os are modules
+// require() used to import modules 
+const path = require('path');  //path handle 
+const fs = require('fs');   // file system 
+const os = require('os');   // os utilities 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 const { startWatcher, initialScan } = require('./watcher');
 const db = require('./database');
@@ -13,7 +17,7 @@ let ORGANIZED_ROOT = '';
 let isSystemConfigured = false;
 let isFoldersAccessible = false;
 
-// Centralized Path Manager
+//** Centralized Path Manager
 async function initializePaths() {
   console.log('SYSTEM: Initializing paths...');
   return new Promise((resolve) => {
@@ -22,18 +26,18 @@ async function initializePaths() {
         console.warn('SYSTEM: Settings table check failed (likely first run).');
         isSystemConfigured = false;
         isFoldersAccessible = false;
-        resolve(); 
+        resolve();
         return;
       }
 
       const settings = {};
       if (rows) rows.forEach(row => settings[row.key] = row.value);
-      
+
       WATCH_PATH = settings.watch_path || '';
       ORGANIZED_ROOT = settings.organized_path || '';
-      
+
       isSystemConfigured = !!(WATCH_PATH && ORGANIZED_ROOT);
-      
+
       if (isSystemConfigured) {
         isFoldersAccessible = fs.existsSync(WATCH_PATH) && fs.existsSync(ORGANIZED_ROOT);
       } else {
@@ -52,6 +56,8 @@ async function initializePaths() {
   });
 }
 
+
+//**creating the Electron desktop window
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -61,7 +67,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
     },
-    titleBarStyle: 'hidden',
+    // titleBarStyle: 'hidden',
     backgroundColor: '#16171d',
   });
 
@@ -76,8 +82,9 @@ function createWindow() {
   return mainWindow;
 }
 
+//**app startup func
 app.whenReady().then(async () => {
-  // Register screenshot:// protocol for local images
+  // Register screenshot:// protocol for local images custom url 
   protocol.registerFileProtocol('screenshot', (request, callback) => {
     const url = request.url.replace('screenshot://', '');
     try {
@@ -88,10 +95,10 @@ app.whenReady().then(async () => {
   });
 
   createWindow();
-  
+
   // Initialize paths AFTER window is created to avoid blocking IPC registration
   await initializePaths();
-  
+
   if (mainWindow) {
     if (isSystemConfigured && isFoldersAccessible) {
       startWatcher(mainWindow, WATCH_PATH, ORGANIZED_ROOT);
@@ -107,6 +114,7 @@ app.whenReady().then(async () => {
   });
 });
 
+//**dashboard refresh function be to fe 
 // Helper to broadcast real-time updates to all windows
 async function emitAppUpdates() {
   if (!mainWindow) return;
@@ -128,14 +136,15 @@ async function emitAppUpdates() {
   const lastProcessed = await new Promise(resolve => {
     db.get('SELECT filename, created_at FROM screenshots WHERE processing_status = "completed" ORDER BY created_at DESC LIMIT 1', (err, row) => resolve(row));
   });
-
+  //Count screenshots per category
   db.all('SELECT main_category, COUNT(*) as count FROM screenshots GROUP BY main_category', (err, rows) => {
     const breakdown = {};
     if (rows) rows.forEach(row => breakdown[row.main_category] = row.count);
+    //Send Stats To React
     mainWindow.webContents.send('stats-updated', { ...stats, lastProcessed, breakdown });
   });
 
-  // 2. Fetch Latest Logs
+  // 2. Fetch Latest Logs to display 
   db.all('SELECT * FROM activity_logs ORDER BY timestamp DESC LIMIT 20', (err, rows) => {
     if (rows) {
       mainWindow.webContents.send('log-updated', rows);
@@ -148,7 +157,7 @@ ipcMain.on('force-stats-update', () => {
   emitAppUpdates();
 });
 
-// IPC Handler for DB Stats (Direct Request)
+// IPC Handler for DB Stats (Direct Request) fe to be
 console.log('IPC REGISTERED: get-stats');
 ipcMain.handle('get-stats', async () => {
   return new Promise((resolve) => {
@@ -170,7 +179,7 @@ ipcMain.handle('get-stats', async () => {
       db.all('SELECT main_category, COUNT(*) as count FROM screenshots GROUP BY main_category', (err, rows) => {
         const breakdown = {};
         if (rows) rows.forEach(row => breakdown[row.main_category] = row.count);
-        
+
         db.get('SELECT filename, created_at FROM screenshots WHERE processing_status = "completed" ORDER BY created_at DESC LIMIT 1', (err, lastProcessed) => {
           resolve({ ...stats, breakdown, lastProcessed });
         });
@@ -193,7 +202,7 @@ ipcMain.handle('get-logs', async () => {
   });
 });
 
-// Search screenshots with keyword or semantic mode
+//**Search screenshots with keyword or semantic mode
 console.log('IPC REGISTERED: search-screenshots');
 ipcMain.handle('search-screenshots', async (event, { searchTerm, category, platform, type }) => {
   return new Promise(async (resolve) => {
@@ -202,7 +211,7 @@ ipcMain.handle('search-screenshots', async (event, { searchTerm, category, platf
       try {
         const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
         const pythonProcess = spawn(pythonCmd, [
-          path.join(__dirname, '../python/analyzer.py'), 
+          path.join(__dirname, '../python/analyzer.py'),
           'semantic_search',
           searchTerm
         ]);
@@ -225,7 +234,7 @@ ipcMain.handle('search-screenshots', async (event, { searchTerm, category, platf
             // Fetch the actual screenshot records for these IDs, preserving the semantic order
             const ids = semanticResults.map(r => r.id);
             const placeholders = ids.map(() => '?').join(',');
-            
+
             db.all(`SELECT * FROM screenshots WHERE id IN (${placeholders})`, ids, (err, rows) => {
               if (err) {
                 console.error('Semantic Search DB error:', err);
@@ -277,12 +286,12 @@ ipcMain.handle('search-screenshots', async (event, { searchTerm, category, platf
   });
 });
 
-// Category Details API (For Exploratory Navigation)
+//** Category Details API (For Exploratory Navigation)
 ipcMain.handle('get-category-details', async (event, category) => {
   return new Promise((resolve) => {
     const isStudy = category === 'STUDY';
     const groupField = isStudy ? 'study_group_name' : 'platform';
-    
+
     db.all(`
       SELECT ${groupField} as name, COUNT(*) as count 
       FROM screenshots 
@@ -301,7 +310,7 @@ ipcMain.handle('get-category-details', async (event, category) => {
   });
 });
 
-// Real Duplicate Management API
+//**Real Duplicate Management API
 console.log('IPC REGISTERED: get-duplicates');
 ipcMain.handle('get-duplicates', async () => {
   return new Promise((resolve) => {
@@ -317,7 +326,7 @@ ipcMain.handle('get-duplicates', async () => {
       // 2. Map duplicates to their originals
       const groups = {};
       const originalIds = [...new Set(dupRows.map(d => d.duplicate_of))];
-      
+
       // 3. Fetch originals metadata
       db.all(`SELECT * FROM screenshots WHERE id IN (${originalIds.join(',')})`, (err, origRows) => {
         const originalsMap = {};
@@ -344,7 +353,7 @@ ipcMain.handle('get-duplicate-stats', async () => {
   return new Promise((resolve) => {
     db.all('SELECT organized_path, original_path FROM screenshots WHERE is_duplicate = 1', (err, rows) => {
       if (err || !rows) return resolve({ count: 0, sizeMB: 0 });
-      
+
       let totalSize = 0;
       rows.forEach(row => {
         const filePath = row.organized_path || row.original_path;
@@ -367,7 +376,7 @@ ipcMain.handle('delete-duplicate', async (event, id) => {
     db.get('SELECT filename, organized_path, original_path FROM screenshots WHERE id = ?', [id], (err, row) => {
       if (row && row.organized_path) {
         const targetPath = row.organized_path;
-        
+
         // HARDENED SAFETY CHECK: Use CANONICAL path validation against CONFIGURED root
         if (ORGANIZED_ROOT && targetPath.startsWith(ORGANIZED_ROOT) && fs.existsSync(targetPath)) {
           try {
@@ -379,7 +388,7 @@ ipcMain.handle('delete-duplicate', async (event, id) => {
           db.log('DELETE_ABORTED', `Path protection triggered for ${row.filename || 'Unknown File'}`, 'warning');
         }
       }
-      
+
       db.run('DELETE FROM screenshots WHERE id = ?', [id], (err) => {
         emitAppUpdates();
         resolve(true);
@@ -494,7 +503,7 @@ ipcMain.handle('get-rebuild-status', async () => {
 
 ipcMain.handle('rebuild-library', async () => {
   console.log('Core: Starting Library Rebuild API...');
-  
+
   rebuildState = { active: true, phase: 'Clearing old data', filesProcessed: 0, totalFiles: 0 };
   if (mainWindow) mainWindow.webContents.send('rebuild-progress', rebuildState);
 
@@ -518,7 +527,7 @@ ipcMain.handle('rebuild-library', async () => {
       db.run('DELETE FROM study_groups');
       db.run('DELETE FROM activity_logs');
       db.log('LIBRARY_RESET', 'Database cleared for re-scan.', 'info');
-      
+
       rebuildState.phase = 'Scanning files';
       if (mainWindow) mainWindow.webContents.send('rebuild-progress', rebuildState);
 
@@ -526,7 +535,7 @@ ipcMain.handle('rebuild-library', async () => {
       // We use a small timeout to let the DB settle
       setTimeout(() => {
         if (mainWindow) {
-          initialScan(mainWindow, WATCH_PATH, ORGANIZED_ROOT, true); 
+          initialScan(mainWindow, WATCH_PATH, ORGANIZED_ROOT, true);
         }
       }, 1000);
 

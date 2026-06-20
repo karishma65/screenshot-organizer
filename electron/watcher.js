@@ -1,3 +1,4 @@
+//chokidar is a file-system monitoring library.
 const chokidar = require('chokidar');
 const path = require('path');
 const fs = require('fs');
@@ -25,20 +26,20 @@ function sendProgress(mainWindow) {
 async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = false) {
   if (!watchPath || !fs.existsSync(watchPath)) return;
   console.log(`Core: Starting ${isRebuild ? 'library rebuild' : 'initial bulk scan'}...`);
-  
+
   // Wait 1 second to ensure DB tables are ready
   await new Promise(resolve => setTimeout(resolve, 1000));
-  
+
   try {
     const files = fs.readdirSync(watchPath);
-    const imageFiles = files.filter(file => 
+    const imageFiles = files.filter(file =>
       ['.png', '.jpg', '.jpeg', '.webp'].includes(path.extname(file).toLowerCase())
     );
 
     totalFiles = imageFiles.length;
     processedCount = 0;
     console.log(`Core: Found ${totalFiles} existing screenshots to check.`);
-    
+
     db.log(isRebuild ? 'Library Rebuild Started' : 'Bulk Scan Started', `Scanning ${totalFiles} existing files`, 'info');
 
     // Update global state if it's a rebuild
@@ -62,7 +63,7 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
       await processScreenshot(filePath, mainWindow, organizedPath);
       processedCount++;
       batchCounter++;
-      
+
       const percentage = totalFiles > 0 ? Math.round((processedCount / totalFiles) * 100) : 0;
 
       if (isRebuild && mainWindow) {
@@ -76,7 +77,7 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
       }
 
       sendProgress(mainWindow);
-      
+
       // 1. Tiny pause between every file (Fast)
       await new Promise(resolve => setTimeout(resolve, 200));
 
@@ -84,14 +85,14 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
       if (batchCounter >= 30) {
         console.log('Core: Batch complete. Taking a 5-second cooling break...');
         db.log('Cooling Break', 'Allowing laptop to stabilize before next batch.', 'info');
-        
+
         await new Promise(resolve => setTimeout(resolve, 5000));
         batchCounter = 0; // Reset batch
       }
     }
 
     console.log('Core: Initial scan complete.');
-    db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)', 
+    db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)',
       [isRebuild ? 'Library Rebuild Finished' : 'Bulk Scan Finished', 'All existing files processed', 'success']);
 
     if (isRebuild && mainWindow) {
@@ -141,7 +142,7 @@ function startWatcher(mainWindow, watchPath, organizedPath) {
   // Debounce rapid file events (max 1 per 200ms)
   const debouncedAdd = debounce((filePath) => {
     console.log(`Watcher: New screenshot detected: ${filePath}`);
-    db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)', 
+    db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)',
       ['New screenshot detected', `File: ${path.basename(filePath)}`, 'info']);
 
     if (mainWindow) {
