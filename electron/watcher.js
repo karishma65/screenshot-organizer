@@ -27,6 +27,10 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
   if (!watchPath || !fs.existsSync(watchPath)) return;
   console.log(`Core: Starting ${isRebuild ? 'library rebuild' : 'initial bulk scan'}...`);
 
+  // Settings
+  const pauseMs = parseInt(await db.getSetting('watcher_initial_pause_ms', '200'), 10);
+  const coolingMs = parseInt(await db.getSetting('watcher_cooling_ms', '5000'), 10);
+
   // Wait 1 second to ensure DB tables are ready
   await new Promise(resolve => setTimeout(resolve, 1000));
 
@@ -53,14 +57,19 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
       });
     }
 
-    // Send initial progress (0%)
     sendProgress(mainWindow);
 
     let batchCounter = 0;
 
     for (const file of imageFiles) {
       const filePath = path.join(watchPath, file);
-      await processScreenshot(filePath, mainWindow, organizedPath);
+      try {
+        await processScreenshot(filePath, mainWindow, organizedPath);
+      } catch (fileError) {
+        console.error(`Failed to process ${file}:`, fileError.message);
+        db.log('SCAN_FILE_ERROR', `Failed to process ${file}: ${fileError.message}`, 'error');
+      }
+      
       processedCount++;
       batchCounter++;
 
@@ -79,14 +88,14 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
       sendProgress(mainWindow);
 
       // 1. Tiny pause between every file (Fast)
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await new Promise(resolve => setTimeout(resolve, pauseMs));
 
       // 2. LARGE COOLING BREAK every 30 files (Heavy Duty Protection)
       if (batchCounter >= 30) {
-        console.log('Core: Batch complete. Taking a 5-second cooling break...');
+        console.log(`Core: Batch complete. Taking a ${coolingMs / 1000}s cooling break...`);
         db.log('Cooling Break', 'Allowing laptop to stabilize before next batch.', 'info');
 
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        await new Promise(resolve => setTimeout(resolve, coolingMs));
         batchCounter = 0; // Reset batch
       }
     }
@@ -107,13 +116,10 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
 
   } catch (error) {
     console.error('Core: Initial scan error:', error);
+    db.log('SCAN_FATAL_ERROR', error.message, 'error');
     if (isRebuild && mainWindow) {
       mainWindow.webContents.send('rebuild-progress', {
-        active: false,
-        phase: 'Failed',
-        filesProcessed: processedCount,
-        totalFiles: totalFiles,
-        percentage: 0
+        active: false, phase: 'Failed', filesProcessed: processedCount, totalFiles: totalFiles, percentage: 0
       });
     }
   }
@@ -121,13 +127,12 @@ async function initialScan(mainWindow, watchPath, organizedPath, isRebuild = fal
 
 let activeWatcher = null;
 
-/**
- * Continuous Watcher: Monitors for future screenshot additions
- */
-function startWatcher(mainWindow, watchPath, organizedPath) {
+async function startWatcher(mainWindow, watchPath, organizedPath) {
   if (activeWatcher) {
     activeWatcher.close();
   }
+
+  const debounceMs = parseInt(await db.getSetting('watcher_debounce_ms', '200'), 10);
 
   // 1. Kick off the initial scan immediately
   initialScan(mainWindow, watchPath, organizedPath);
@@ -136,14 +141,12 @@ function startWatcher(mainWindow, watchPath, organizedPath) {
   activeWatcher = chokidar.watch(watchPath, {
     ignored: /(^|[\/\\])\../,
     persistent: true,
-    ignoreInitial: true, // Crucial: initialScan() handles the existing files
+    ignoreInitial: true,
   });
 
-  // Debounce rapid file events (max 1 per 200ms)
   const debouncedAdd = debounce((filePath) => {
     console.log(`Watcher: New screenshot detected: ${filePath}`);
-    db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)',
-      ['New screenshot detected', `File: ${path.basename(filePath)}`, 'info']);
+    db.log('New screenshot detected', `File: ${path.basename(filePath)}`, 'info');
 
     if (mainWindow) {
       mainWindow.webContents.send('fromMain', {
@@ -151,8 +154,10 @@ function startWatcher(mainWindow, watchPath, organizedPath) {
         payload: { path: filePath, filename: path.basename(filePath) }
       });
     }
-    processScreenshot(filePath, mainWindow, organizedPath);
-  }, 200);
+    processScreenshot(filePath, mainWindow, organizedPath).catch(err => {
+        console.error('Watcher processing failed:', err);
+    });
+  }, debounceMs);
 
   activeWatcher.on('add', debouncedAdd);
 

@@ -15,12 +15,27 @@ import numpy as np
 from sentence_transformers import SentenceTransformer, util
 import torch
 import clip
+import faiss
 from PIL import Image
+from insightface.app import FaceAnalysis
+from transformers import AutoProcessor, AutoModel
+import retrieval_engine
+import vector_manager
 
 # ── MODEL INIT ────────────────────────────────────────────────────────────────
-model  = SentenceTransformer('all-MiniLM-L6-v2')
 device = "cuda" if torch.cuda.is_available() else "cpu"
-clip_model, preprocess = clip.load("ViT-B/32", device=device)
+
+try:
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+except Exception as e:
+    print(f"ERROR: SentenceTransformer load failed: {e}", file=sys.stderr)
+    model = None
+
+try:
+    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+except Exception as e:
+    print(f"ERROR: CLIP load failed: {e}", file=sys.stderr)
+    clip_model, preprocess = None, None
 
 # ── CLIP LABELS ───────────────────────────────────────────────────────────────
 
@@ -226,10 +241,29 @@ def make_unique_cluster_name(conn, base_name: str) -> str:
 
 # ── DYNAMIC SEMANTIC CLUSTERING ───────────────────────────────────────────────
 
-# Similarity thresholds
-REUSE_THRESHOLD  = 0.62   # ≥ this → assign to existing cluster
-CREATE_THRESHOLD = 0.62   # < this → create a new cluster
-# (They're equal — a single threshold. Kept as two constants for clarity.)
+def get_retrieval_thresholds():
+    """Fetches retrieval related thresholds from the database with built-in defaults."""
+    # Defaults
+    t = {
+        "reuse_threshold": 0.62,
+        "create_threshold": 0.62,
+        "face_similarity": 0.4,
+        "visual_similarity": 0.3
+    }
+    try:
+        from contextlib import closing
+        with closing(get_db_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT key, value FROM settings WHERE key IN ('reuse_threshold', 'create_threshold', 'face_similarity_threshold', 'visual_similarity_threshold')")
+            rows = cursor.fetchall()
+            for row in rows:
+                if row['key'] == 'reuse_threshold': t['reuse_threshold'] = float(row['value'])
+                if row['key'] == 'create_threshold': t['create_threshold'] = float(row['value'])
+                if row['key'] == 'face_similarity_threshold': t['face_similarity'] = float(row['value'])
+                if row['key'] == 'visual_similarity_threshold': t['visual_similarity'] = float(row['value'])
+    except:
+        pass
+    return t
 
 def analyze_semantic(text: str) -> str:
     """
@@ -246,12 +280,13 @@ def analyze_semantic(text: str) -> str:
 
     Returns "NONE" for empty / very short text.
     """
-    if not text or len(text.strip()) < 20:
+    if not text or len(text.strip()) < 20 or model is None:
         return "NONE"
 
     if not os.path.exists(DB_PATH):
         return "NONE"
 
+    thresholds = get_retrieval_thresholds()
     try:
         conn = get_db_connection()
         ensure_clusters_table(conn)
@@ -278,7 +313,7 @@ def analyze_semantic(text: str) -> str:
             best_idx   = int(scores.argmax())
             best_score = float(scores[best_idx])
 
-            if best_score >= REUSE_THRESHOLD:
+            if best_score >= thresholds['reuse_threshold']:
                 # ── Reuse existing cluster ──────────────────────────────
                 cid   = cluster_ids[best_idx]
                 cname = cluster_names[best_idx]
@@ -410,6 +445,7 @@ def analyze_layout(image_path):
 # ── SEMANTIC SEARCH (unchanged) ───────────────────────────────────────────────
 
 def semantic_search(query):
+    if model is None: return []
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -424,6 +460,7 @@ def semantic_search(query):
     ids   = [r[0] for r in rows]
     texts = [r[1] for r in rows]
 
+    thresholds = get_retrieval_thresholds()
     q_emb = model.encode(query, convert_to_tensor=True)
     t_emb = model.encode(texts, convert_to_tensor=True)
     scores = util.cos_sim(q_emb, t_emb)[0]
@@ -431,18 +468,20 @@ def semantic_search(query):
     top_idx = np.argsort(-scores.cpu().numpy())[:20]
     return [
         {"id": ids[i], "score": float(scores[i])}
-        for i in top_idx if scores[i] > 0.35
+        for i in top_idx if scores[i] > thresholds['visual_similarity']
     ]
 
 
 # ── VISUAL ANALYZER (unchanged) ───────────────────────────────────────────────
 
 def analyze_visual(image_path):
-    if not os.path.exists(image_path):
+    if not os.path.exists(image_path) or clip_model is None:
         return []
 
     try:
-        image       = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
+        with Image.open(image_path) as img_raw:
+            image = preprocess(img_raw).unsqueeze(0).to(device)
+        
         text_inputs = clip.tokenize(VISUAL_LABELS).to(device)
 
         with torch.no_grad():
@@ -473,63 +512,112 @@ def analyze_visual(image_path):
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
+def handle_request(req):
+    mode = req.get("mode", "")
+
+    if mode == "semantic":
+        text   = req.get("text", "")
+        return analyze_semantic(text)
+
+    elif mode == "cluster_id":
+        cname = req.get("cluster_name", "")
+        cid   = get_cluster_id_by_name(cname)
+        return {"cluster_id": cid}
+
+    elif mode == "embedding":
+        text = req.get("text", "")
+        if text and model:
+            return model.encode(text[:1000]).tolist()
+        return []
+
+    elif mode == "layout":
+        img_path = req.get("image_path", "")
+        layout, conf = analyze_layout(img_path)
+        return {"layout": layout, "confidence": conf}
+
+    elif mode == "visual":
+        img_path = req.get("image_path", "")
+        return analyze_visual(img_path)
+
+    elif mode == "retrieval_analyze":
+        img_path = req.get("image_path", "")
+        q_th = req.get("quality_threshold")
+        return retrieval_engine.analyze_screenshot(img_path, quality_threshold=q_th)
+
+    elif mode == "retrieval_push_vectors":
+        sid = req.get("screenshot_id")
+        visual_embeddings = req.get("visual_embeddings", [])
+        faces = req.get("faces", [])
+        if visual_embeddings:
+            vector_manager.add_visual(sid, visual_embeddings)
+        for face in faces:
+            vector_manager.add_face(face["embedding"], face["db_id"])
+        vector_manager.save()
+        return {"success": True}
+
+    elif mode == "retrieval_rollback":
+        sid = req.get("screenshot_id")
+        face_ids = req.get("face_ids", [])
+        if sid:
+            vector_manager.remove_screenshot_vectors(sid, face_ids=face_ids)
+            vector_manager.save()
+            try:
+                with get_db_connection() as conn:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.execute("DELETE FROM screenshots WHERE id = ?", (sid,))
+                    conn.commit()
+            except Exception as e:
+                print(f"ROLLBACK DB ERROR: {e}", file=sys.stderr)
+        return {"success": True}
+
+    elif mode == "retrieval_search":
+        q_type = req.get("type", "text")
+        if q_type == "text":
+            text = req.get("query", "")
+            embedding = retrieval_engine.encode_text(text)
+            indices, distances = vector_manager.search_visual(embedding)
+            return {
+                "search_type": "text_to_image",
+                "faiss_indices": indices, "scores": [float(d) for d in distances]
+            }
+        elif q_type == "image":
+            q_path = req.get("query_image_path")
+            query_data = retrieval_engine.analyze_screenshot(q_path, quality_threshold=0.1)
+            v_indices, v_scores = vector_manager.search_visual(query_data["visual_embedding"])
+            all_face_results = []
+            if "faces" in query_data:
+                for face in query_data["faces"]:
+                    indices, scores = vector_manager.search_face(face["embedding"])
+                    all_face_results.append({"indices": indices, "scores": scores})
+            return {
+                "search_type": "hybrid_image",
+                "visual": {"indices": v_indices, "scores": [float(s) for s in v_scores]},
+                "faces": all_face_results
+            }
+
+    elif mode == "rebuild_reset":
+        vector_manager.visual_index = None
+        vector_manager.face_index = None
+        for p in [vector_manager.visual_index_path, vector_manager.face_index_path]:
+            if os.path.exists(p):
+                try: os.unlink(p)
+                except: pass
+        return {"success": True}
+
+    return {"error": f"Unknown mode: {mode}"}
+
+
 def run_bridge():
-    """
-    Persistent bridge mode: read one JSON line per request from stdin,
-    write one JSON line response to stdout.
-
-    Request format:  { "mode": "<mode>", ...payload fields... }
-
-    Supported modes:
-      semantic    { text }              → cluster_name string (auto-create/reuse)
-      cluster_id  { cluster_name }      → { cluster_id: int | null }
-      embedding   { text }              → float array (sentence embedding)
-      layout      { image_path }        → { layout, confidence }
-      visual      { image_path }        → [{ label, confidence }, ...]
-    """
     # Signal readiness to JS bridge
     print(json.dumps({"ready": True}), flush=True)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
-        if not raw_line:
-            continue
+        if not raw_line: continue
         try:
-            req  = json.loads(raw_line)
-            mode = req.get("mode", "")
-
-            if mode == "semantic":
-                text   = req.get("text", "")
-                result = analyze_semantic(text)
-                # Return plain string cluster name
-                print(json.dumps(result), flush=True)
-
-            elif mode == "cluster_id":
-                cname = req.get("cluster_name", "")
-                cid   = get_cluster_id_by_name(cname)
-                print(json.dumps({"cluster_id": cid}), flush=True)
-
-            elif mode == "embedding":
-                text = req.get("text", "")
-                if text:
-                    emb = model.encode(text[:1000]).tolist()
-                else:
-                    emb = []
-                print(json.dumps(emb), flush=True)
-
-            elif mode == "layout":
-                img_path = req.get("image_path", "")
-                layout, conf = analyze_layout(img_path)
-                print(json.dumps({"layout": layout, "confidence": conf}), flush=True)
-
-            elif mode == "visual":
-                img_path = req.get("image_path", "")
-                results  = analyze_visual(img_path)
-                print(json.dumps(results), flush=True)
-
-            else:
-                print(json.dumps({"error": f"Unknown mode: {mode}"}), flush=True)
-
+            req = json.loads(raw_line)
+            result = handle_request(req)
+            print(json.dumps(result), flush=True)
         except Exception as e:
             print(json.dumps({"error": str(e)}), flush=True)
 

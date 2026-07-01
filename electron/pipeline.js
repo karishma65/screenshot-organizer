@@ -56,14 +56,30 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
 
     await bridge.boot();
 
-    await new Promise((resolve) => {
-      db.run('INSERT OR IGNORE INTO screenshots (original_path, filename, processing_status) VALUES (?, ?, ?)',
-        [filePath, fileName, 'processing'], function (err) {
-          currentId = this.lastID;
-          resolve();
-        }
-      );
-    });
+    try {
+      const insertedId = await new Promise((resolve, reject) => {
+        db.run('INSERT OR IGNORE INTO screenshots (original_path, filename, processing_status) VALUES (?, ?, ?)',
+          [filePath, fileName, 'processing'], function (err) {
+            if (err) return reject(err);
+            if (this.lastID !== 0) resolve(this.lastID);
+            else {
+              db.get('SELECT id FROM screenshots WHERE original_path = ?', [filePath], (err, row) => {
+                if (err) reject(err);
+                else resolve(row ? row.id : null);
+              });
+            }
+          }
+        );
+      });
+      currentId = insertedId;
+    } catch (e) {
+      console.error('Initial DB insert failed:', e);
+      throw e;
+    }
+
+    if (!currentId) {
+      throw new Error(`Failed to initialize or retrieve record for ${fileName}`);
+    }
 
     db.log('ANALYSIS_START', `Processing: ${fileName}`, 'info');
 
@@ -188,15 +204,66 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
     }
 
     // Mapped Confidences for Debugging
+    const humanConf = labelConf('human_photo');
+    const animalConf = labelConf('animal_photo');
     const pdfConf = labelConf('pdf_page');
     const slideConf = labelConf('presentation_slide');
     const bookConf = labelConf('book_page');
     const scannedConf = labelConf('scanned_doc');
     const certConf = labelConf('certificate');
-    const humanConf = labelConf('human_photo');
-    const animalConf = labelConf('animal_photo');
 
     console.log(`[DEBUG] SIGNAL CHECK [${fileName}] -> pdf:${pdfConf.toFixed(2)}, slide:${slideConf.toFixed(2)}, book:${bookConf.toFixed(2)}, human:${humanConf.toFixed(2)}, animal:${animalConf.toFixed(2)}`);
+
+    // 5. Advanced Retrieval Indexing (OCR, Faces, SigLIP)
+    console.log(`[Retrieval] Analyzing: ${fileName}`);
+    let retrievalData = null;
+    let faceIdsTracked = [];
+    try {
+       // Fetch dynamic threshold from settings (with safe default)
+       const qualityThreshold = await db.getSetting('face_quality_threshold', '0.1');
+
+       retrievalData = await bridge.request('retrieval_analyze', { 
+         image_path: filePath,
+         quality_threshold: qualityThreshold
+       });
+       
+       if (retrievalData && !retrievalData.error) {
+           const facePushData = [];
+           if (retrievalData.faces) {
+             for (const face of retrievalData.faces) {
+               const faceId = await new Promise((resolve, reject) => {
+                 db.run(`
+                   INSERT INTO faces (screenshot_id, bbox, confidence, blur_score, face_quality_score, size_px)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                 `, [currentId, JSON.stringify(face.bbox), face.confidence, face.blur_score, face.face_quality_score, face.size_px], 
+                 function(err) { 
+                   if (err) reject(err);
+                   else resolve(this.lastID); 
+                 });
+               });
+               faceIdsTracked.push(faceId);
+               facePushData.push({ db_id: faceId, embedding: face.embedding });
+             }
+           }
+
+           const visualEmbeddings = [retrievalData.visual_embedding, ...(retrievalData.patch_embeddings || [])];
+           await bridge.request('retrieval_push_vectors', {
+             screenshot_id: currentId,
+             visual_embeddings: visualEmbeddings,
+             faces: facePushData
+           });
+           
+           if (retrievalData.full_text) {
+             text = retrievalData.full_text;
+           }
+       } else if (retrievalData && retrievalData.error) {
+           // Log but continue if non-fatal
+           console.warn(`Retrieval indexing partial failure for ${fileName}: ${retrievalData.error}`);
+       }
+    } catch (e) {
+      console.error('Retrieval Indexing Failed:', e);
+      errorMessage += `Retrieval Indexing Failed; `;
+    }
 
     // 5. Semantic Analysis
     let studyGroup = 'NONE';
@@ -399,20 +466,34 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
     const visual_conf = visualConfidence;
     const final_conf = finalConfidence;
 
-    // ── 8.8  Physical organization ───────────────────────────────────────
+    // ── 8.8  Physical organization (Collision Protected) ───────────────────
     let organizedDir = path.join(organizedRoot, mainCategory);
 
     if (mainCategory === 'STUDY' && studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') {
       organizedDir = path.join(organizedDir, studyGroup);
     }
 
-    if (!fs.existsSync(organizedDir)) {
-      fs.mkdirSync(organizedDir, { recursive: true });
+    try {
+      await fs.promises.mkdir(organizedDir, { recursive: true });
+    } catch (e) {
+      console.warn('Directory Creation Failed (might exist):', e.message);
     }
 
-    const destPath = path.join(organizedDir, fileName);
-    fs.copyFileSync(filePath, destPath);
-    db.log('PHYSICAL_MOVE', `${fileName} moved to ${mainCategory}`, 'success');
+    // Filename collision protection
+    let finalFileName = fileName;
+    let destPath = path.join(organizedDir, finalFileName);
+    let counter = 1;
+
+    while (fs.existsSync(destPath)) { // existsSync is fine for small loops but copy is heavy
+      const ext = path.extname(fileName);
+      const base = path.basename(fileName, ext);
+      finalFileName = `${base}_${counter}${ext}`;
+      destPath = path.join(organizedDir, finalFileName);
+      counter++;
+    }
+
+    await fs.promises.copyFile(filePath, destPath);
+    db.log('PHYSICAL_MOVE', `${finalFileName} moved to ${mainCategory}`, 'success');
 
     // ── 10  Embedding ─────────────────────────────────────────────────────
     let embeddingBlob = null;
@@ -427,33 +508,51 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
       console.error('Embedding Generation Failed:', e);
     }
 
-    // ── 11  DB save ───────────────────────────────────────────────────────
-    db.run(`
-      UPDATE screenshots SET
-        original_path = ?, organized_path = ?, filename = ?, ocr_text = ?,
-        main_category = ?, subcategory = ?, platform = ?,
-        study_group_name = ?, layout_type = ?, content_types = ?,
-        document_type = ?, is_code = ?, code_language = ?, editor = ?,
-        original_hash = ?, ui_confidence = ?, semantic_confidence = ?,
-        visual_confidence = ?, layout_confidence = ?, final_confidence = ?,
-        text_embedding = ?,
-        processing_status = 'completed', error_message = ?
-      WHERE id = ?
-    `, [
-      filePath, destPath, fileName, text,
-      mainCategory, subcategory, platform,
-      studyGroup, layout, JSON.stringify(visualLabels),
-      docType, isCode ? 1 : 0, codeLang, editor,
-      phash, ui_conf, semantic_conf,
-      visual_conf, layout_conf, final_conf,
-      embeddingBlob,
-      errorMessage || null,
-      currentId
-    ], (err) => {
-      if (err) db.log('DB_ERROR', `Failed to update ${fileName}: ${err.message}`, 'error');
-      const { ipcMain } = require('electron');
-      ipcMain.emit('force-stats-update');
-    });
+    // ── 11  DB save (Transactional Wrap) ──────────────────────────────────
+    try {
+      await new Promise((resolve, reject) => {
+        db.run(`
+          UPDATE screenshots SET
+            original_path = ?, organized_path = ?, filename = ?, ocr_text = ?,
+            main_category = ?, subcategory = ?, platform = ?,
+            study_group_name = ?, layout_type = ?, content_types = ?,
+            document_type = ?, is_code = ?, code_language = ?, editor = ?,
+            original_hash = ?, ui_confidence = ?, semantic_confidence = ?,
+            visual_confidence = ?, layout_confidence = ?, final_confidence = ?,
+            text_embedding = ?,
+            ocr_full = ?, meeting_ids = ?,
+            processing_status = 'completed', error_message = ?
+          WHERE id = ?
+        `, [
+          filePath, destPath, finalFileName, text,
+          mainCategory, subcategory, platform,
+          studyGroup, layout, JSON.stringify(visualLabels),
+          docType, isCode ? 1 : 0, codeLang, editor,
+          phash, ui_conf, semantic_conf,
+          visual_conf, layout_conf, final_conf,
+          embeddingBlob,
+          retrievalData ? retrievalData.full_text : text,
+          retrievalData ? JSON.stringify(retrievalData.meeting_ids) : '[]',
+          errorMessage || null,
+          currentId
+        ], (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    } catch (saveError) {
+       console.error('CORE: DB persistence failed, triggering transactional rollback.', saveError);
+       // Purge FAISS vectors and delete orphaned records
+       await bridge.request('retrieval_rollback', { 
+         screenshot_id: currentId, 
+         face_ids: faceIdsTracked || [] 
+       });
+       throw saveError;
+    }
+
+    // Trigger UI updates
+    const { ipcMain } = require('electron');
+    ipcMain.emit('force-stats-update');
 
     db.log('CATEGORIZED',
       `${fileName} → ${mainCategory} (${Math.round(finalConfidence * 100)}% conf)`,

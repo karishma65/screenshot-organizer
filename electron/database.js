@@ -14,6 +14,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
     db.run('PRAGMA journal_mode = WAL');
     db.run('PRAGMA synchronous = NORMAL');
     db.run('PRAGMA busy_timeout = 5000');
+    db.run('PRAGMA foreign_keys = ON');
   }
 });
 
@@ -64,6 +65,8 @@ db.serialize(() => {
       layout_confidence REAL DEFAULT 0,
       final_confidence REAL DEFAULT 0,
       text_embedding BLOB,
+      ocr_full TEXT,
+      meeting_ids TEXT,
       is_duplicate INTEGER DEFAULT 0,
       duplicate_of INTEGER,
       similarity_score REAL DEFAULT 0,
@@ -99,7 +102,9 @@ db.serialize(() => {
     { name: 'visual_confidence', type: 'REAL DEFAULT 0' },
     { name: 'layout_confidence', type: 'REAL DEFAULT 0' },
     { name: 'final_confidence', type: 'REAL DEFAULT 0' },
-    { name: 'text_embedding', type: 'BLOB' }
+    { name: 'text_embedding', type: 'BLOB' },
+    { name: 'ocr_full', type: 'TEXT' },
+    { name: 'meeting_ids', type: 'TEXT' }
   ];
 
   schemaUpdates.forEach(col => {
@@ -107,6 +112,31 @@ db.serialize(() => {
       // It's expected to fail if the column already exists
     });
   });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS faces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      screenshot_id INTEGER,
+      bbox TEXT,
+      confidence REAL,
+      blur_score REAL,
+      face_quality_score REAL,
+      size_px INTEGER,
+      FOREIGN KEY(screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS study_clusters (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        cluster_name        TEXT    NOT NULL UNIQUE,
+        topic_label         TEXT    NOT NULL,
+        representative_text TEXT,
+        member_count        INTEGER DEFAULT 1,
+        created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 
   db.run(`
     CREATE TABLE IF NOT EXISTS settings (
@@ -120,15 +150,33 @@ db.serialize(() => {
 });
 
 // Helper for safe logging
+let cachedIpcMain = null;
 db.log = (action, details, status) => {
   db.run('INSERT INTO activity_logs (action, details, status) VALUES (?, ?, ?)', [action, details, status], (err) => {
      if (err) {
        console.warn('DB Log skip (too early):', action);
      } else {
        // Trigger UI update
-       const { ipcMain } = require('electron');
-       ipcMain.emit('force-stats-update');
+       if (!cachedIpcMain) {
+         try {
+           cachedIpcMain = require('electron').ipcMain;
+         } catch (e) {
+           return;
+         }
+       }
+       if (cachedIpcMain) {
+         cachedIpcMain.emit('force-stats-update');
+       }
      }
+  });
+};
+
+db.getSetting = (key, defaultValue) => {
+  return new Promise((resolve) => {
+    db.get('SELECT value FROM settings WHERE key = ?', [key], (err, row) => {
+      if (err || !row) resolve(defaultValue);
+      else resolve(row.value);
+    });
   });
 };
 

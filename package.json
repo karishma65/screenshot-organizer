@@ -14,13 +14,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@tensorflow-models/mobilenet": "^2.1.1",
-    "@tensorflow/tfjs": "^4.22.0",
     "chokidar": "^5.0.0",
     "electron": "^42.3.0",
     "electron-builder": "^26.8.1",
     "imghash": "^1.1.4",
-    "jimp": "^1.6.1",
     "sqlite3": "^6.0.1",
     "tesseract.js": "^7.0.0"
   },

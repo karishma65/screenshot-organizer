@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     console.log('Preload: Invoking select-folder IPC');
     return ipcRenderer.invoke('select-folder');
   },
+  selectImage: () => ipcRenderer.invoke('select-image'),
   getStats: () => ipcRenderer.invoke('get-stats'),
   getLogs: () => ipcRenderer.invoke('get-logs'),
   getDuplicates: () => ipcRenderer.invoke('get-duplicates'),
@@ -41,6 +42,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getPlatforms: () => ipcRenderer.invoke('get-platforms'),
   getRebuildStatus: () => ipcRenderer.invoke('get-rebuild-status'),
   rebuildLibrary: () => ipcRenderer.invoke('rebuild-library'),
+  universalSearch: (params) => ipcRenderer.invoke('universal-search', params),
+  findSimilar: (id) => ipcRenderer.invoke('find-similar', id),
   openFolder: (path) => ipcRenderer.send('open-folder', path),
 });
 
