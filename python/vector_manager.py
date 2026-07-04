@@ -1,6 +1,7 @@
 import os
 import faiss
 import numpy as np
+import sys
 
 class VectorManager:
     def __init__(self, data_dir):
@@ -13,18 +14,28 @@ class VectorManager:
         
         # 0. Load Indices with Corruption Recovery
         if os.path.exists(self.visual_index_path):
+            print(f"[DIAG] Loading visual index from: {self.visual_index_path}", file=sys.stderr, flush=True)
             try:
                 self.visual_index = faiss.read_index(self.visual_index_path)
+                print("[DIAG] Visual index loaded", file=sys.stderr, flush=True)
             except Exception as e:
-                print(f"FAISS Recovery: Visual index corrupted ({str(e)}). Recreating...")
+                print(f"FAISS Recovery: Visual index corrupted ({str(e)}). Recreating...", file=sys.stderr, flush=True)
                 if os.path.exists(self.visual_index_path): os.remove(self.visual_index_path)
 
         if os.path.exists(self.face_index_path):
+            print(f"[DIAG] Loading face index from: {self.face_index_path}", file=sys.stderr, flush=True)
             try:
                 self.face_index = faiss.read_index(self.face_index_path)
+                print("[DIAG] Face index loaded", file=sys.stderr, flush=True)
             except Exception as e:
-                print(f"FAISS Recovery: Face index corrupted ({str(e)}). Recreating...")
+                print(f"FAISS Recovery: Face index corrupted ({str(e)}). Recreating...", file=sys.stderr, flush=True)
                 if os.path.exists(self.face_index_path): os.remove(self.face_index_path)
+
+        print("[DEBUG][FAISS]", file=sys.stderr)
+        print(f"Visual index exists: {self.visual_index is not None}", file=sys.stderr)
+        print(f"Visual vector count: {self.visual_index.ntotal if self.visual_index else 0}", file=sys.stderr)
+        print(f"Face index exists: {self.face_index is not None}", file=sys.stderr)
+        print(f"Face vector count: {self.face_index.ntotal if self.face_index else 0}", file=sys.stderr)
             
     def _ensure_index(self, index_type, dim):
         if index_type == "visual":
@@ -49,7 +60,7 @@ class VectorManager:
             if os.path.exists(temp_path):
                 os.replace(temp_path, path)
         except Exception as e:
-            print(f"FAISS Save Error: {str(e)}")
+            print(f"FAISS Save Error: {str(e)}", file=sys.stderr)
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
@@ -74,6 +85,8 @@ class VectorManager:
         embs = np.array(embeddings).astype('float32')
         faiss.normalize_L2(embs)
         
+        print(f"[DEBUG] add_visual: screenshot_id={screenshot_id}, embeddings={len(embs)}", file=sys.stderr)
+        
         self._ensure_index("visual", embs.shape[1])
         
         # 1. Prevent Duplicates: IndexIDMap.remove_ids removes ALL vectors associated with the ID.
@@ -83,11 +96,14 @@ class VectorManager:
         # 2. Add New Vectors
         ids = np.array([screenshot_id] * len(embs)).astype('int64')
         self.visual_index.add_with_ids(embs, ids)
+        print(f"[DEBUG] add_visual complete: Current visual index size = {self.visual_index.ntotal}", file=sys.stderr)
         
     def add_face(self, embedding, face_db_id):
         """Associate a face embedding with its DB ID after clearing old entry."""
         emb = np.array([embedding]).astype('float32')
         faiss.normalize_L2(emb)
+        
+        print(f"[DEBUG] add_face: face_db_id={face_db_id}", file=sys.stderr)
         
         self._ensure_index("face", emb.shape[1])
         
@@ -97,6 +113,7 @@ class VectorManager:
         # 2. Add New Face Vector
         ids = np.array([face_db_id]).astype('int64')
         self.face_index.add_with_ids(emb, ids)
+        print(f"[DEBUG] add_face complete: Current face index size = {self.face_index.ntotal}", file=sys.stderr)
         
     def search_visual(self, embedding, k=60):
         if self.visual_index is None: return [], []
@@ -108,6 +125,7 @@ class VectorManager:
             return [], []
 
         distances, indices = self.visual_index.search(emb, k)
+        print(f"[DEBUG] search_visual: Returned IDs={indices[0].tolist()}, Scores={distances[0].tolist()}", file=sys.stderr)
         
         results = {} 
         for dist, idx in zip(distances[0], indices[0]):
@@ -129,6 +147,7 @@ class VectorManager:
             return [], []
 
         distances, indices = self.face_index.search(emb, k)
+        print(f"[DEBUG] search_face: Returned IDs={indices[0].tolist()}, Scores={distances[0].tolist()}", file=sys.stderr)
         
         valid_indices = []
         valid_scores = []

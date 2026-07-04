@@ -227,6 +227,8 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
          quality_threshold: qualityThreshold
        });
        
+       console.log(`[DEBUG][INDEX]\nFile: ${fileName}\nFaces detected: ${retrievalData?.faces?.length || 0}\nVisual embeddings: ${retrievalData?.visual_embedding ? 1 : 0}\nPatch embeddings: ${retrievalData?.patch_embeddings?.length || 0}\nMeeting IDs: ${retrievalData?.meeting_ids?.join(', ') || 'None'}`);
+
        if (retrievalData && !retrievalData.error) {
            const facePushData = [];
            if (retrievalData.faces) {
@@ -252,6 +254,8 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
              visual_embeddings: visualEmbeddings,
              faces: facePushData
            });
+           
+           console.log(`[DEBUG] retrieval_push_vectors success: screenshot_id=${currentId}, faces=${facePushData.length}, visual=${visualEmbeddings.length}`);
            
            if (retrievalData.full_text) {
              text = retrievalData.full_text;
@@ -531,8 +535,8 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
           phash, ui_conf, semantic_conf,
           visual_conf, layout_conf, final_conf,
           embeddingBlob,
-          retrievalData ? retrievalData.full_text : text,
-          retrievalData ? JSON.stringify(retrievalData.meeting_ids) : '[]',
+          (retrievalData && retrievalData.full_text !== undefined && retrievalData.full_text !== null) ? retrievalData.full_text : null,
+          (retrievalData && retrievalData.meeting_ids) ? JSON.stringify(retrievalData.meeting_ids) : '[]',
           errorMessage || null,
           currentId
         ], (err) => {

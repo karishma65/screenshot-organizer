@@ -17,7 +17,7 @@ class PythonBridge extends EventEmitter {
     this._rl = null;
     this._booted = false;
     this._booting = false;
-    this._TIMEOUT_MS = 30000; 
+    this._TIMEOUT_MS = 120000;
   }
 
   // ── Boot / keep-alive ──────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ class PythonBridge extends EventEmitter {
       });
 
       this._rl = readline.createInterface({ input: this._proc.stdout });
-      
+
       let initialResponse = true;
       this._rl.on('line', line => {
         if (!line.trim()) return;
@@ -51,14 +51,14 @@ class PythonBridge extends EventEmitter {
               resolve();
               return;
             }
-          } catch(e) {}
+          } catch (e) { }
         }
 
         const pending = this._queue.shift();
         if (!pending) return;
-        
+
         if (pending.timeout) clearTimeout(pending.timeout);
-        
+
         try {
           pending.resolve(JSON.parse(line));
         } catch (e) {
@@ -148,7 +148,7 @@ class PythonBridge extends EventEmitter {
       try {
         this._proc.stdin.end();
         this._proc.kill();
-      } catch (e) {}
+      } catch (e) { }
       this._proc = null;
       this._booted = false;
       this._booting = false;

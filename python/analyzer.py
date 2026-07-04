@@ -22,20 +22,54 @@ from transformers import AutoProcessor, AutoModel
 import retrieval_engine
 import vector_manager
 
-# ── MODEL INIT ────────────────────────────────────────────────────────────────
+# ── GLOBAL STDOUT REDIRECTION ──
+# Store original stdout for bridge communication
+_orig_stdout = sys.stdout
+_orig_stdout_fd = os.dup(1)
+
+def bridge_print(data):
+    """Explicitly print JSON to the REAL stdout for the bridge."""
+    payload = json.dumps(data)
+    os.write(_orig_stdout_fd, (payload + "\n").encode('utf-8'))
+
+# Redirect everything else to stderr (including native output)
+sys.stdout = sys.stderr
+os.dup2(sys.stderr.fileno(), 1)
+
+print("[DIAG] Global stdout redirection active", file=sys.stderr, flush=True)
+
+print("[DIAG] Starting analyzer.py initialization...", file=sys.stderr, flush=True)
+print(f"[DIAG] Torch version: {torch.__version__}", file=sys.stderr, flush=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[DIAG] Device selected: {device}", file=sys.stderr, flush=True)
+
+print("[DIAG] Torch sanity check (moving tensor to device)...", file=sys.stderr, flush=True)
+t_test = torch.randn(1, 1).to(device)
+print("[DIAG] Torch sanity check PASSED", file=sys.stderr, flush=True)
 
 try:
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+    print("[DIAG] Loading SentenceTransformer...", file=sys.stderr, flush=True)
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+    print("[DIAG] SentenceTransformer loaded", file=sys.stderr, flush=True)
 except Exception as e:
-    print(f"ERROR: SentenceTransformer load failed: {e}", file=sys.stderr)
+    print(f"ERROR: SentenceTransformer failed: {e}", file=sys.stderr, flush=True)
     model = None
 
 try:
+    print("[DIAG] Loading CLIP model...", file=sys.stderr, flush=True)
     clip_model, preprocess = clip.load("ViT-B/32", device=device)
+    print("[DIAG] CLIP model loaded", file=sys.stderr, flush=True)
 except Exception as e:
-    print(f"ERROR: CLIP load failed: {e}", file=sys.stderr)
-    clip_model, preprocess = None, None
+    print(f"ERROR: CLIP failed: {e}", file=sys.stderr, flush=True)
+    clip_model = None
+
+try:
+    print("[DIAG] Instantiating RetrievalEngine...", file=sys.stderr, flush=True)
+    retrieval_eng = retrieval_engine.RetrievalEngine(use_gpu=(device == "cuda"))
+    print("[DIAG] RetrievalEngine instantiated", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"ERROR: RetrievalEngine init failed: {e}", file=sys.stderr, flush=True)
+    retrieval_eng = None
 
 # ── CLIP LABELS ───────────────────────────────────────────────────────────────
 
@@ -134,6 +168,14 @@ LABEL_THRESHOLDS = {
 }
 
 DB_PATH = os.path.join(os.path.dirname(__file__), '../data/metadata.db')
+
+try:
+    print("[DIAG] Instantiating VectorManager...", file=sys.stderr, flush=True)
+    v_manager = vector_manager.VectorManager(data_dir=os.path.dirname(DB_PATH))
+    print("[DIAG] VectorManager instantiated", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"ERROR: VectorManager init failed: {e}", file=sys.stderr)
+    v_manager = None
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
 
@@ -449,7 +491,7 @@ def semantic_search(query):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, ocr_text FROM screenshots WHERE ocr_text IS NOT NULL AND ocr_text != ''"
+        "SELECT id, ocr_full FROM screenshots WHERE ocr_full IS NOT NULL AND ocr_full != ''"
     )
     rows = cursor.fetchall()
     conn.close()
@@ -542,25 +584,41 @@ def handle_request(req):
     elif mode == "retrieval_analyze":
         img_path = req.get("image_path", "")
         q_th = req.get("quality_threshold")
-        return retrieval_engine.analyze_screenshot(img_path, quality_threshold=q_th)
+        if not retrieval_eng: return {"error": "RetrievalEngine not initialized"}
+        return retrieval_eng.analyze_screenshot(img_path, quality_threshold=q_th)
 
     elif mode == "retrieval_push_vectors":
         sid = req.get("screenshot_id")
         visual_embeddings = req.get("visual_embeddings", [])
         faces = req.get("faces", [])
-        if visual_embeddings:
-            vector_manager.add_visual(sid, visual_embeddings)
+        
+        if not v_manager: 
+            return {"error": "VectorManager not initialized"}
+        
+        updated = False
+        # Validate that embeddings contain actual data (not null/undefined)
+        valid_visual = [v for v in visual_embeddings if v is not None and len(v) > 0]
+        if valid_visual:
+            v_manager.add_visual(sid, valid_visual)
+            updated = True
+            
         for face in faces:
-            vector_manager.add_face(face["embedding"], face["db_id"])
-        vector_manager.save()
-        return {"success": True}
+            if face.get("embedding") and face.get("db_id"):
+                v_manager.add_face(face["embedding"], face["db_id"])
+                updated = True
+                
+        if updated:
+            v_manager.save()
+            return {"success": True, "saved": True}
+        return {"success": True, "saved": False}
 
     elif mode == "retrieval_rollback":
         sid = req.get("screenshot_id")
         face_ids = req.get("face_ids", [])
         if sid:
-            vector_manager.remove_screenshot_vectors(sid, face_ids=face_ids)
-            vector_manager.save()
+            if v_manager:
+                v_manager.remove_screenshot_vectors(sid, face_ids=face_ids)
+                v_manager.save()
             try:
                 with get_db_connection() as conn:
                     conn.execute("PRAGMA foreign_keys = ON")
@@ -572,44 +630,119 @@ def handle_request(req):
 
     elif mode == "retrieval_search":
         q_type = req.get("type", "text")
+        # Increase threshold for better relevance
+        SIMILARITY_THRESHOLD = 0.42
+        
         if q_type == "text":
             text = req.get("query", "")
-            embedding = retrieval_engine.encode_text(text)
-            indices, distances = vector_manager.search_visual(embedding)
+            if not retrieval_eng: return {"error": "RetrievalEngine not initialized"}
+            embedding = retrieval_eng.encode_text(text)
+            if not v_manager: return {"error": "VectorManager not initialized"}
+            indices, distances = v_manager.search_visual(embedding)
+            
+            filtered = [(idx, float(dist)) for idx, dist in zip(indices, distances) if dist >= SIMILARITY_THRESHOLD]
             return {
                 "search_type": "text_to_image",
-                "faiss_indices": indices, "scores": [float(d) for d in distances]
+                "faiss_indices": [f[0] for f in filtered], 
+                "scores": [f[1] for f in filtered]
             }
+            
         elif q_type == "image":
             q_path = req.get("query_image_path")
-            query_data = retrieval_engine.analyze_screenshot(q_path, quality_threshold=0.1)
-            v_indices, v_scores = vector_manager.search_visual(query_data["visual_embedding"])
-            all_face_results = []
-            if "faces" in query_data:
-                for face in query_data["faces"]:
-                    indices, scores = vector_manager.search_face(face["embedding"])
-                    all_face_results.append({"indices": indices, "scores": scores})
-            return {
-                "search_type": "hybrid_image",
-                "visual": {"indices": v_indices, "scores": [float(s) for s in v_scores]},
-                "faces": all_face_results
-            }
+            if not retrieval_eng: return {"error": "RetrievalEngine not initialized"}
+            if not v_manager: return {"error": "VectorManager not initialized"}
+            
+            query_data = retrieval_eng.analyze_screenshot(q_path, quality_threshold=0.1)
+            query_vectors = [query_data["visual_embedding"]] + (query_data.get("patch_embeddings", []))
+            
+            query_embs = np.array(query_vectors).astype('float32')
+            faiss.normalize_L2(query_embs)
+            
+            if v_manager.visual_index:
+                # Search more neighbours to find better local matches
+                v_distances, v_indices = v_manager.visual_index.search(query_embs, 80)
+                
+                # screenshot_id -> list of scores [global_score, patch_score1, patch_score2...]
+                matches = {} 
+                
+                for row_idx, (dists, idxs) in enumerate(zip(v_distances, v_indices)):
+                    is_global = (row_idx == 0)
+                    for d, idx in zip(dists, idxs):
+                        if idx == -1: continue
+                        sid = int(idx)
+                        score = float(d)
+                        if sid not in matches:
+                            matches[sid] = {"global": 0.0, "patches": []}
+                        if is_global:
+                            matches[sid]["global"] = score
+                        else:
+                            matches[sid]["patches"].append(score)
+
+                # Final Ranker: Global + Weighted Average of patches
+                aggregated_scores = {}
+                for sid, m in matches.items():
+                    g_score = m["global"]
+                    # If global score is low, but patches are high, it's an "image-in-image" match
+                    p_score = 0.0
+                    if m["patches"]:
+                        # Take average of top 3 patches for this screenshot
+                        top_p = sorted(m["patches"], reverse=True)[:3]
+                        p_score = sum(top_p) / len(top_p)
+                    
+                    # FINAL SIMILARITY FORMULA
+                    # Weight global and local (patches)
+                    # If it's a direct match, global will be ~1.0
+                    # If it's a part of a screenshot, p_score will be ~0.9+
+                    final_score = max(g_score, p_score * 1.1) # Boost strong local matches
+                    # Cap at 1.0
+                    aggregated_scores[sid] = min(1.0, final_score)
+
+                # 3. OCR Refinement
+                q_text = query_data.get("full_text", "").strip()
+                if q_text and len(q_text) > 20 and model:
+                    q_text_emb = model.encode(q_text[:500], convert_to_tensor=True)
+                    ids_to_refine = sorted(aggregated_scores, key=aggregated_scores.get, reverse=True)[:40]
+                    if ids_to_refine:
+                        try:
+                            with get_db_connection() as conn:
+                                placeholders = ','.join(['?'] * len(ids_to_refine))
+                                rows = conn.execute(f"SELECT id, ocr_full FROM screenshots WHERE id IN ({placeholders})", ids_to_refine).fetchall()
+                                for row in rows:
+                                    sid, db_text = row['id'], row['ocr_full']
+                                    if db_text and len(db_text) > 20:
+                                        db_text_emb = model.encode(db_text[:500], convert_to_tensor=True)
+                                        ocr_sim = float(util.cos_sim(q_text_emb, db_text_emb)[0])
+                                        aggregated_scores[sid] = (aggregated_scores[sid] * 0.75) + (ocr_sim * 0.25)
+                        except: pass
+
+                # Sort and filter
+                sorted_res = sorted(aggregated_scores.items(), key=lambda x: x[1], reverse=True)
+                final_indices = [r[0] for r in sorted_res if r[1] >= SIMILARITY_THRESHOLD]
+                final_scores = [r[1] for r in sorted_res if r[1] >= SIMILARITY_THRESHOLD]
+
+                return {
+                    "search_type": "hybrid_image",
+                    "visual": {"indices": final_indices, "scores": final_scores},
+                    "faces": [] # Keeping format, frontend handles specific face search
+                }
+            return {"error": "Visual index not available"}
 
     elif mode == "rebuild_reset":
-        vector_manager.visual_index = None
-        vector_manager.face_index = None
-        for p in [vector_manager.visual_index_path, vector_manager.face_index_path]:
-            if os.path.exists(p):
-                try: os.unlink(p)
-                except: pass
+        if v_manager:
+            v_manager.visual_index = None
+            v_manager.face_index = None
+            for p in [v_manager.visual_index_path, v_manager.face_index_path]:
+                if os.path.exists(p):
+                    try: os.unlink(p)
+                    except: pass
         return {"success": True}
-
+        
     return {"error": f"Unknown mode: {mode}"}
 
 
 def run_bridge():
     # Signal readiness to JS bridge
-    print(json.dumps({"ready": True}), flush=True)
+    bridge_print({"ready": True})
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -617,9 +750,9 @@ def run_bridge():
         try:
             req = json.loads(raw_line)
             result = handle_request(req)
-            print(json.dumps(result), flush=True)
+            bridge_print(result)
         except Exception as e:
-            print(json.dumps({"error": str(e)}), flush=True)
+            bridge_print({"error": str(e)})
 
 
 if __name__ == "__main__":
@@ -632,26 +765,26 @@ if __name__ == "__main__":
     # ── One-shot CLI modes (for debugging / testing) ───────────────────────
     elif mode == "semantic_search":
         query = sys.argv[2] if len(sys.argv) > 2 else ""
-        print(json.dumps(semantic_search(query)))
+        bridge_print(semantic_search(query))
 
     elif mode == "analyze_layout":
         img_path = sys.argv[2] if len(sys.argv) > 2 else ""
         layout, conf = analyze_layout(img_path)
-        print(json.dumps({"layout": layout, "confidence": conf}))
+        bridge_print({"layout": layout, "confidence": conf})
 
     elif mode == "analyze_semantic":
         # Returns the cluster_name string directly
         text_in = sys.argv[2] if len(sys.argv) > 2 else ""
-        print(json.dumps({"study_group": analyze_semantic(text_in)}))
+        bridge_print({"study_group": analyze_semantic(text_in)})
 
     elif mode == "analyze_visual":
         img_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        print(json.dumps(analyze_visual(img_path)))
+        bridge_print(analyze_visual(img_path))
 
     elif mode == "cluster_id":
         cname = sys.argv[2] if len(sys.argv) > 2 else ""
         cid   = get_cluster_id_by_name(cname)
-        print(json.dumps({"cluster_id": cid}))
+        bridge_print({"cluster_id": cid})
 
     else:
         if len(sys.argv) > 1:

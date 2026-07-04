@@ -70,9 +70,10 @@ function registerSearchHandlers(getGlobalPaths) {
       let sql = 'SELECT id, filename, organized_path, original_path, main_category, platform, created_at FROM screenshots WHERE 1=1';
       let params = [];
       if (searchTerm && searchTerm.trim() !== '') {
-        sql += ' AND (ocr_text LIKE ? OR filename LIKE ?)';
-        const likeParam = `%${searchTerm}%`;
-        params.push(likeParam, likeParam);
+        const normalizedSearch = searchTerm.trim().replace(/\s+/g, ' ');
+        sql += " AND (REPLACE(REPLACE(ocr_text, x'0A', ' '), x'09', ' ') LIKE ? OR REPLACE(REPLACE(ocr_full, x'0A', ' '), x'09', ' ') LIKE ? OR filename LIKE ?)";
+        const likeParam = `%${normalizedSearch}%`;
+        params.push(likeParam, likeParam, `%${searchTerm}%`);
       }
       if (category && category !== 'All') {
         sql += ' AND main_category = ?';
@@ -121,7 +122,8 @@ function registerSearchHandlers(getGlobalPaths) {
           const isMeetingID = idPatterns.some(p => p.test(lowerQuery));
           
           let exactMatches = await new Promise(res => {
-            db.all("SELECT *, 'EXACT_OCR' as retrieval_type, 1.0 as similarity_score FROM screenshots WHERE meeting_ids LIKE ? OR ocr_full LIKE ?", [`%${lowerQuery}%`, `%${lowerQuery}%`], (err, rows) => res(rows || []));
+            const normalizedQuery = query.trim().replace(/\s+/g, ' ');
+            db.all("SELECT *, 'EXACT_OCR' as retrieval_type, 1.0 as similarity_score FROM screenshots WHERE meeting_ids LIKE ? OR REPLACE(REPLACE(ocr_full, x'0A', ' '), x'09', ' ') LIKE ? OR REPLACE(REPLACE(ocr_text, x'0A', ' '), x'09', ' ') LIKE ?", [`%${lowerQuery}%`, `%${normalizedQuery}%`, `%${normalizedQuery}%`], (err, rows) => res(rows || []));
           });
 
           if (isMeetingID) {
@@ -137,7 +139,8 @@ function registerSearchHandlers(getGlobalPaths) {
           if (lowerQuery.length > 2) {
             fuzzyMatches = await new Promise(res => {
                const xIds = exactMatches.length ? exactMatches.map(r=>r.id).join(',') : '0';
-               db.all(`SELECT *, 'KEYWORD' as retrieval_type, 0.85 as similarity_score FROM screenshots WHERE ocr_text LIKE ? AND id NOT IN (${xIds})`, [`%${lowerQuery}%`], (err, rows) => res(rows || []));
+               const normalizedQuery = query.trim().replace(/\s+/g, ' ');
+               db.all(`SELECT *, 'KEYWORD' as retrieval_type, 0.85 as similarity_score FROM screenshots WHERE (REPLACE(REPLACE(ocr_text, x'0A', ' '), x'09', ' ') LIKE ? OR REPLACE(REPLACE(ocr_full, x'0A', ' '), x'09', ' ') LIKE ?) AND id NOT IN (${xIds})`, [`%${normalizedQuery}%`, `%${normalizedQuery}%`], (err, rows) => res(rows || []));
             });
 
             const searchRes = await bridge.request('retrieval_search', { type: 'text', query: lowerQuery });
@@ -172,8 +175,16 @@ function registerSearchHandlers(getGlobalPaths) {
 
         } else if (type === 'image') {
           const searchRes = await bridge.request('retrieval_search', { type: 'image', query_image_path: imagePath });
+          console.log(`[DEBUG][PYTHON RESPONSE]\nsearch_type: ${searchRes?.search_type}\nvisual indices: ${searchRes?.visual?.indices}\nvisual scores: ${searchRes?.visual?.scores}\nnumber of face groups: ${searchRes?.faces?.length || 0}`);
+          if (searchRes?.faces) {
+            searchRes.faces.forEach((g, i) => {
+              console.log(`Face Group ${i}: indices=[${g.indices}], scores=[${g.scores}]`);
+            });
+          }
+
           if (!searchRes || searchRes.search_type !== 'hybrid_image') return resolve({ results: [], copiedCount: 0 });
           const fused = await fuseHybridResults(searchRes, thresholds);
+          console.log(`[DEBUG] Final fused result count: ${fused.length}`);
           const copyCount = await collectResults(`ImageSearch_${Date.now()}`, fused.map(r => r.organized_path || r.original_path), organizedPath);
           resolve({ results: fused, copiedCount: copyCount });
         }

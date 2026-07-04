@@ -5,239 +5,161 @@ import torch
 import faiss
 from PIL import Image
 from insightface.app import FaceAnalysis
-from transformers import AutoProcessor, AutoModel
-from paddleocr import PaddleOCR
+from transformers import AutoProcessor, SiglipModel
 import json
+import re
+import sys
 
 class RetrievalEngine:
     def __init__(self, use_gpu=False):
         self.device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
-        
-        # 1. Face Analysis (RetinaFace + ArcFace)
-        face_providers = ['CPUExecutionProvider']
-        if self.device == "cuda":
-            face_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            
+        self.ocr_model = None 
+
         try:
-            self.face_app = FaceAnalysis(name='buffalom_l', providers=face_providers)
-            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
-        except Exception as e:
-            print(f"Face Analysis INIT ERROR: {e}. Falling back to CPU.")
-            self.face_app = FaceAnalysis(name='buffalom_l', providers=['CPUExecutionProvider'])
-            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+            import ssl
+            ssl._create_default_https_context = ssl._create_unverified_context
+        except: pass
+
+        # 1. SigLIP - LOAD FIRST TO PREVENT NATIVE CONFLICT (0xC0000005)
+        # Use siglip-base-patch16-224 for significantly better memory stability
+        self.siglip_model_id = "google/siglip-base-patch16-224"
+        print(f"[DIAG] Initializing SigLIP: {self.siglip_model_id}", file=sys.stderr, flush=True)
         
-        # 2. SigLIP (Visual Embeddings)
-        self.siglip_model_id = "google/siglip-so400m-patch14-384"
         self.siglip_processor = AutoProcessor.from_pretrained(self.siglip_model_id)
+        self.siglip_model = SiglipModel.from_pretrained(self.siglip_model_id, low_cpu_mem_usage=True).to(self.device).eval()
+        
+        # 2. InsightFace
+        print("[DIAG] Initializing InsightFace...", file=sys.stderr, flush=True)
+        face_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == "cuda" else ['CPUExecutionProvider']
+        self.face_app = FaceAnalysis(name='buffalo_l', providers=face_providers)
+        self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+        # 3. Model Warmup (Fixes "First Screenshot 0 Embeddings")
+        print("[DIAG] Performing SigLIP warmup...", file=sys.stderr, flush=True)
         try:
-            self.siglip_model = AutoModel.from_pretrained(self.siglip_model_id).to(self.device)
+            # Run one dummy inference to warm up the compute graph
+            dummy_img = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
+            warmup_in = self.siglip_processor(images=dummy_img, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                _ = self.siglip_model.get_image_features(**warmup_in)
+            print("[DIAG] Warmup complete", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"SigLIP CUDA INIT ERROR: {e}. Falling back to CPU.")
-            self.device = "cpu"
-            self.siglip_model = AutoModel.from_pretrained(self.siglip_model_id).to("cpu")
-        
-        # 3. OCR (PaddleOCR)
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-        
-        # 4. Indices
-        self.visual_index = None
-        self.face_index = None
+            print(f"[DIAG] Warmup failed: {e}", file=sys.stderr, flush=True)
+
+        print("[DIAG] AI models loaded successfully", file=sys.stderr, flush=True)
+
+    def _get_ocr(self):
+        if self.ocr_model is None:
+            # Set environment variables BEFORE importing PaddleOCR
+            os.environ["FLAGS_use_onednn"] = "0"
+            os.environ["FLAGS_enable_pir_api"] = "0"
+            from paddleocr import PaddleOCR
+            self.ocr_model = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+        return self.ocr_model
 
     def get_blur_score(self, image):
-        """Calculates the variance of the Laplacian to estimate image blur."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         return cv2.Laplacian(gray, cv2.CV_64F).var()
         
     def calculate_face_quality(self, det_score, blur_score, size_px):
-        """Combines multiple metrics into a single quality score (0.0 to 1.0)"""
-        size_comp = min(1.0, size_px / 40000.0)
-        blur_comp = min(1.0, blur_score / 150.0)
-        return (det_score * 0.4) + (blur_comp * 0.4) + (size_comp * 0.2)
+        return (det_score * 0.4) + (min(1.0, blur_score / 150.0) * 0.4) + (min(1.0, size_px / 40000.0) * 0.2)
         
     def get_patches(self, img_pil, patch_size=224, max_patches=24):
-        """Robust patch sampling for any image size with coordinate-based deduplication."""
         w, h = img_pil.size
-        patches = []
-        seen_coords = set()
-        
-        # Clamp patch size if image is smaller than requested patch
-        actual_patch_w = min(patch_size, w)
-        actual_patch_h = min(patch_size, h)
-        
-        # 1. Corner patches (highly relevant for logos)
-        corners = [
-            (0, 0, actual_patch_w, actual_patch_h),
-            (max(0, w - actual_patch_w), 0, w, actual_patch_h),
-            (0, max(0, h - actual_patch_h), actual_patch_w, h),
-            (max(0, w - actual_patch_w), max(0, h - actual_patch_h), w, h)
-        ]
-        
+        pw, ph = min(patch_size, w), min(patch_size, h)
+        patches = []; seen_coords = set()
+        corners = [(0,0,pw,ph), (max(0,w-pw),0,w,ph), (0,max(0,h-ph),pw,h), (max(0,w-pw),max(0,h-ph),w,h)]
         for c in corners:
-            if c not in seen_coords:
-                patches.append(img_pil.crop(c))
-                seen_coords.add(c)
-            
-        # 2. Central patch
+            if c not in seen_coords: patches.append(img_pil.crop(c)); seen_coords.add(c)
         cx, cy = w // 2, h // 2
-        central = (
-            max(0, cx - actual_patch_w // 2), 
-            max(0, cy - actual_patch_h // 2), 
-            min(w, cx + actual_patch_w // 2), 
-            min(h, cy + actual_patch_h // 2)
-        )
-        if central not in seen_coords:
-            patches.append(img_pil.crop(central))
-            seen_coords.add(central)
-        
-        # 3. Grid sampling (only if enough space)
-        if w > actual_patch_w or h > actual_patch_h:
-            stride_x = max(actual_patch_w, w // 4)
-            stride_y = max(actual_patch_h, h // 4)
-            
-            for y in range(0, max(1, h - actual_patch_h + 1), stride_y):
-                for x in range(0, max(1, w - actual_patch_w + 1), stride_x):
-                    p_box = (x, y, x + actual_patch_w, y + actual_patch_h)
-                    if len(patches) < max_patches and p_box not in seen_coords:
-                        patches.append(img_pil.crop(p_box))
-                        seen_coords.add(p_box)
-        
+        central = (max(0,cx-pw//2), max(0,cy-ph//2), min(w,cx+pw//2), min(h,cy+ph//2))
+        if central not in seen_coords: patches.append(img_pil.crop(central)); seen_coords.add(central)
+        if w > pw or h > ph:
+            sx, sy = max(pw, w//4), max(ph, h//4)
+            for y in range(0, max(1, h-ph+1), sy):
+                for x in range(0, max(1, w-pw+1), sx):
+                    b = (x,y,x+pw,y+ph)
+                    if len(patches)<max_patches and b not in seen_coords: patches.append(img_pil.crop(b)); seen_coords.add(b)
         return patches[:max_patches]
 
+    def _normalize(self, feats):
+        # Extremely robust normalization that handles both Tensors and ModelOutput objects
+        if hasattr(feats, "pooler_output"):
+            feats = feats.pooler_output
+        elif not isinstance(feats, torch.Tensor) and hasattr(feats, "__getitem__"):
+            feats = feats[0]
+        return feats / feats.norm(p=2, dim=-1, keepdim=True)
+
     def analyze_screenshot(self, image_path, quality_threshold):
-        """Deep analysis of screenshot: OCR, Face Detection, and SigLIP Embeddings."""
-        if not os.path.exists(image_path):
-            return {"error": "File not found"}
-            
-        try:
-            # 0. Load and Validate Image
-            img_cv = cv2.imread(image_path)
-            if img_cv is None:
-                return {"error": "Invalid image data (cv2)"}
-                
-            with Image.open(image_path) as img_temp:
-                img_pil = img_temp.convert('RGB')
-        except Exception as e:
-            return {"error": f"Image corruption or load error: {str(e)}"}
-            
-        # 1. OCR (PaddleOCR)
-        ocr_result = self.ocr.ocr(image_path, cls=True)
+        if not os.path.exists(image_path): return {"error": "File not found"}
+        img_cv = cv2.imread(image_path)
+        with Image.open(image_path) as img_temp: img_pil = img_temp.convert('RGB')
+        
         full_text = ""
         meeting_ids = []
-        
-        # Pattern library for meeting detection
-        ID_PATTERNS = [
-            r'[a-z0-9]{3}-[a-z0-9]{4}-[a-z0-9]{3}',   # Google Meet
-            r'[0-9]{3}-[0-9]{3}-[0-9]{3}',            # 9-digit Zoom style
-            r'meeting-[a-z0-9]+',                     # Custom label meeting-xyz
-            r'room-[a-z0-9]+',                        # Custom label room-xyz
-            r'conference-[a-z0-9]+',                  # Custom label conference-xyz
-        ]
-        
-        if ocr_result and ocr_result[0]:
-            import re
-            for line in ocr_result[0]:
-                text = line[1][0]
-                full_text += text + " "
-                lower_text = text.lower()
-                for pattern in ID_PATTERNS:
-                    m_ids = re.findall(pattern, lower_text)
+        try:
+            print("[DIAG] Initializing OCR...", file=sys.stderr, flush=True)
+            ocr = self._get_ocr()
+            print("[DIAG] Running OCR...", file=sys.stderr, flush=True)
+            try: res = ocr.ocr(image_path, cls=True)
+            except: res = ocr.ocr(image_path)
+            
+            if res and res[0]:
+                print(f"[DIAG] OCR extracted {len(res[0])} lines", file=sys.stderr, flush=True)
+                for line in res[0]:
+                    text = line[1][0]
+                    full_text += text + " "
+                    m_ids = re.findall(r'[a-z0-9]{3}-[a-z0-9]{4}-[a-z0-9]{3}|[0-9]{3}-[0-9]{3}-[0-9]{3}', text.lower())
                     meeting_ids.extend(m_ids)
-        
-        # 2. Face Analysis
+            else:
+                print("[DIAG] OCR result was empty", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[DIAG] OCR ERROR: {str(e)}", file=sys.stderr, flush=True)
+
         faces = self.face_app.get(img_cv)
         face_data = []
-        
-        # QUALITY VALIDATION: Never use hardcoded fallback here.
-        # Threshold must be passed from Electron/Database settings.
-        try:
-            q_thresh = float(quality_threshold)
-        except (TypeError, ValueError):
-            # If invalid, return error to avoid unpredictable behavior
-            return {"error": f"Invalid Face Quality Threshold: {quality_threshold}"}
-        
+        qt = float(quality_threshold)
         for face in faces:
             bbox = face.bbox.astype(int).tolist()
             w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
-            
-            face_crop = img_cv[max(0,bbox[1]):min(img_cv.shape[0],bbox[3]), max(0,bbox[0]):min(img_cv.shape[1],bbox[2])]
-            if face_crop.size == 0: continue
-            
-            blur_score = self.get_blur_score(face_crop)
-            quality_score = self.calculate_face_quality(float(face.det_score), blur_score, w*h)
-            
-            if quality_score < q_thresh:
-                continue
-            
-            face_data.append({
-                "bbox": bbox,
-                "embedding": face.embedding.tolist(),
-                "confidence": float(face.det_score),
-                "blur_score": blur_score,
-                "face_quality_score": quality_score,
-                "size_px": w*h
-            })
-        
-        # 3. Patch-based Visual Embedding (SigLIP)
+            crop = img_cv[max(0,bbox[1]):min(img_cv.shape[0],bbox[3]), max(0,bbox[0]):min(img_cv.shape[1],bbox[2])]
+            if crop.size==0: continue
+            q = self.calculate_face_quality(float(face.det_score), self.get_blur_score(crop), w*h)
+            if q < qt: continue
+            face_data.append({"bbox": bbox, "embedding": face.embedding.tolist(), "confidence": float(face.det_score), "face_quality_score": q})
+
         inputs = self.siglip_processor(images=img_pil, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            features = self.siglip_model.get_image_features(**inputs)
-            features = features / features.norm(p=2, dim=-1, keepdim=True)
-            global_embedding = features.cpu().numpy()[0].tolist()
+            img_outputs = self.siglip_model.get_image_features(**inputs)
+            img_outputs = self._normalize(img_outputs)
+            v_emb = img_outputs.cpu().numpy()[0].tolist()
             
-        patch_embeddings = []
+        p_embs = []
         patches = self.get_patches(img_pil)
         if patches:
-            p_inputs = self.siglip_processor(images=patches, return_tensors="pt").to(self.device)
+            p_in = self.siglip_processor(images=patches, return_tensors="pt").to(self.device)
             with torch.no_grad():
-                p_features = self.siglip_model.get_image_features(**p_inputs)
-                p_features = p_features / p_features.norm(p=2, dim=-1, keepdim=True)
-                patch_embeddings = p_features.cpu().numpy().tolist()
+                p_out = self.siglip_model.get_image_features(**p_in)
+                p_out = self._normalize(p_out)
+                p_embs = p_out.cpu().numpy().tolist()
             
-        return {
-            "full_text": full_text.strip(),
-            "meeting_ids": list(set(meeting_ids)),
-            "faces": face_data,
-            "visual_embedding": global_embedding,
-            "patch_embeddings": patch_embeddings
-        }
+        return {"full_text": full_text.strip(), "meeting_ids": list(set(meeting_ids)), "faces": face_data, "visual_embedding": v_emb, "patch_embeddings": p_embs}
 
     def encode_text(self, text):
         inputs = self.siglip_processor(text=[text], return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
-            features = self.siglip_model.get_text_features(**inputs)
-            features = features / features.norm(p=2, dim=-1, keepdim=True)
-            return features.cpu().numpy()[0].tolist()
+            t_out = self.siglip_model.get_text_features(**inputs)
+            t_out = self._normalize(t_out)
+            return t_out.cpu().numpy()[0].tolist()
 
     def search_image(self, query_image_path):
-        """Unified hybrid search: supports multiple faces in query image."""
-        if not os.path.exists(query_image_path):
-            return {"error": "Query image not found"}
-            
-        try:
-            img_cv = cv2.imread(query_image_path)
-            if img_cv is None:
-                return {"error": "Invalid query image data"}
-            with Image.open(query_image_path) as img_temp:
-                img_pil = img_temp.convert('RGB')
-        except Exception as e:
-             return {"error": f"Failed to load query image: {str(e)}"}
-        
-        # 1. Global Visual Search (SigLIP)
+        if not os.path.exists(query_image_path): return {"error": "Query image not found"}
+        img_cv = cv2.imread(query_image_path)
+        with Image.open(query_image_path) as img_temp: img_pil = img_temp.convert('RGB')
         inputs = self.siglip_processor(images=img_pil, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            v_features = self.siglip_model.get_image_features(**inputs)
-            v_features = v_features / v_features.norm(p=2, dim=-1, keepdim=True)
-            visual_embedding = v_features.cpu().numpy()[0].tolist()
-            
-        # 2. Multi-Face Search (ArcFace)
+            i_out = self.siglip_model.get_image_features(**inputs)
+            i_out = self._normalize(i_out)
+            v_emb = i_out.cpu().numpy()[0].tolist()
         faces = self.face_app.get(img_cv)
-        face_embeddings = []
-        # Return all detected face embeddings to Electron for multi-query matching
-        if faces:
-            for face in faces:
-                face_embeddings.append(face.embedding.tolist())
-            
-        return {
-            "visual_embedding": visual_embedding,
-            "face_embeddings": face_embeddings # Note: changed from face_embedding to plural
-        }
+        return {"visual_embedding": v_emb, "face_embeddings": [f.embedding.tolist() for f in faces]}
