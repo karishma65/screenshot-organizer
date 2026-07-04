@@ -63,6 +63,37 @@ except Exception as e:
     print(f"ERROR: CLIP failed: {e}", file=sys.stderr, flush=True)
     clip_model = None
 
+def get_setting(key, default):
+    try:
+        conn = get_db_connection()
+        res = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return res[0] if res else default
+    except: return default
+
+def get_scoring_weights():
+    return {
+        "visual": float(get_setting("weight_visual", 0.7)),
+        "semantic": float(get_setting("weight_semantic", 0.15)),
+        "face": float(get_setting("weight_face", 0.1)),
+        "identifier": float(get_setting("weight_id_match", 0.05)),
+        "global_vs_patch": float(get_setting("weight_global", 0.4)),
+        "patch_density_boost": float(get_setting("boost_density", 0.05)),
+        "max_density_boost": float(get_setting("boost_density_max", 1.25))
+    }
+
+def extract_identifiers(text):
+    """Broad set of identifiers: URLs, Emails, GH repos, Meeting IDs, etc."""
+    if not text: return set()
+    matches = []
+    # URLs / GH
+    matches.extend(re.findall(r'https?://[^\s<>"]+|github\.com/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+', text.lower()))
+    # Emails
+    matches.extend(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text.lower()))
+    # Meeting IDs / Alphanumeric IDs / Order IDs
+    matches.extend(re.findall(r'[a-z0-9]{3}-[a-z0-9]{4}-[a-z0-9]{3}|[0-9]{3}-[0-9]{3}-[0-9]{3}|[A-Z0-9]{8,12}', text))
+    return set([m.strip('.,/()') for m in matches if len(m) > 4])
+
 try:
     print("[DIAG] Instantiating RetrievalEngine...", file=sys.stderr, flush=True)
     retrieval_eng = retrieval_engine.RetrievalEngine(use_gpu=(device == "cuda"))
@@ -630,8 +661,8 @@ def handle_request(req):
 
     elif mode == "retrieval_search":
         q_type = req.get("type", "text")
-        # Increase threshold for better relevance
-        SIMILARITY_THRESHOLD = 0.42
+        SIMILARITY_THRESHOLD = float(get_setting("retrieval_threshold", 0.45))
+        weights = get_scoring_weights()
         
         if q_type == "text":
             text = req.get("query", "")
@@ -646,12 +677,28 @@ def handle_request(req):
                 "faiss_indices": [f[0] for f in filtered], 
                 "scores": [f[1] for f in filtered]
             }
+
+        elif q_type == "get_vectors":
+            sid = req.get("screenshot_id")
+            if not v_manager or not v_manager.visual_index: return {"error": "Index unavailable"}
+            try:
+                flat_index = v_manager.visual_index.index
+                vectors = []
+                ids = faiss.vector_to_array(v_manager.visual_index.id_map)
+                matching_indices = np.where(ids == sid)[0]
+                for midx in matching_indices:
+                    vec = flat_index.reconstruct(int(midx))
+                    vectors.append(vec.tolist())
+                return {"visual_embeddings": vectors}
+            except Exception as e:
+                return {"error": f"Vector reconstruction failed: {str(e)}"}
             
         elif q_type == "image":
             q_path = req.get("query_image_path")
             if not retrieval_eng: return {"error": "RetrievalEngine not initialized"}
             if not v_manager: return {"error": "VectorManager not initialized"}
             
+            # 1. Multi-Scale Analysis
             query_data = retrieval_eng.analyze_screenshot(q_path, quality_threshold=0.1)
             query_vectors = [query_data["visual_embedding"]] + (query_data.get("patch_embeddings", []))
             
@@ -659,11 +706,9 @@ def handle_request(req):
             faiss.normalize_L2(query_embs)
             
             if v_manager.visual_index:
-                # Search more neighbours to find better local matches
-                v_distances, v_indices = v_manager.visual_index.search(query_embs, 80)
-                
-                # screenshot_id -> list of scores [global_score, patch_score1, patch_score2...]
-                matches = {} 
+                # Batch search for all patches + global
+                v_distances, v_indices = v_manager.visual_index.search(query_embs, 100)
+                match_groups = {} 
                 
                 for row_idx, (dists, idxs) in enumerate(zip(v_distances, v_indices)):
                     is_global = (row_idx == 0)
@@ -671,59 +716,118 @@ def handle_request(req):
                         if idx == -1: continue
                         sid = int(idx)
                         score = float(d)
-                        if sid not in matches:
-                            matches[sid] = {"global": 0.0, "patches": []}
-                        if is_global:
-                            matches[sid]["global"] = score
-                        else:
-                            matches[sid]["patches"].append(score)
+                        if sid not in match_groups: match_groups[sid] = {"global": 0.0, "patches": []}
+                        if is_global: match_groups[sid]["global"] = score
+                        else: match_groups[sid]["patches"].append(score)
 
-                # Final Ranker: Global + Weighted Average of patches
+                # 2. Base Ranking: Spatial Density Aggregation
                 aggregated_scores = {}
-                for sid, m in matches.items():
+                for sid, m in match_groups.items():
                     g_score = m["global"]
-                    # If global score is low, but patches are high, it's an "image-in-image" match
-                    p_score = 0.0
-                    if m["patches"]:
-                        # Take average of top 3 patches for this screenshot
-                        top_p = sorted(m["patches"], reverse=True)[:3]
-                        p_score = sum(top_p) / len(top_p)
+                    p_scores = m["patches"]
+                    if not p_scores:
+                        final_v_score = g_score
+                    else:
+                        top_p = sorted(p_scores, reverse=True)[:3]
+                        avg_p = sum(top_p) / len(top_p)
+                        raw_boost = 1.0 + (math.log(len(p_scores) + 1) * weights["patch_density_boost"])
+                        density_boost = min(weights["max_density_boost"], raw_boost)
+                        w_g = weights["global_vs_patch"]
+                        final_v_score = (g_score * w_g + avg_p * (1.0 - w_g)) * density_boost
                     
-                    # FINAL SIMILARITY FORMULA
-                    # Weight global and local (patches)
-                    # If it's a direct match, global will be ~1.0
-                    # If it's a part of a screenshot, p_score will be ~0.9+
-                    final_score = max(g_score, p_score * 1.1) # Boost strong local matches
-                    # Cap at 1.0
-                    aggregated_scores[sid] = min(1.0, final_score)
+                    aggregated_scores[sid] = {"visual": min(1.0, final_v_score), "semantic": 0.0, "face": 0.0, "identifier": 0.0}
 
-                # 3. OCR Refinement
-                q_text = query_data.get("full_text", "").strip()
-                if q_text and len(q_text) > 20 and model:
-                    q_text_emb = model.encode(q_text[:500], convert_to_tensor=True)
-                    ids_to_refine = sorted(aggregated_scores, key=aggregated_scores.get, reverse=True)[:40]
-                    if ids_to_refine:
-                        try:
-                            with get_db_connection() as conn:
-                                placeholders = ','.join(['?'] * len(ids_to_refine))
-                                rows = conn.execute(f"SELECT id, ocr_full FROM screenshots WHERE id IN ({placeholders})", ids_to_refine).fetchall()
-                                for row in rows:
-                                    sid, db_text = row['id'], row['ocr_full']
-                                    if db_text and len(db_text) > 20:
-                                        db_text_emb = model.encode(db_text[:500], convert_to_tensor=True)
-                                        ocr_sim = float(util.cos_sim(q_text_emb, db_text_emb)[0])
-                                        aggregated_scores[sid] = (aggregated_scores[sid] * 0.75) + (ocr_sim * 0.25)
-                        except: pass
+                # 3. Component Interaction & Fusion (Lazy Semantic + Jaccard Identifiers)
+                ids_to_fuse = list(aggregated_scores.keys())
+                if ids_to_fuse:
+                    try:
+                        q_text = query_data.get("full_text", "").strip()
+                        q_ids = extract_identifiers(q_text)
+                        
+                        q_text_emb = None
+                        if q_text and len(q_text) > 15 and model:
+                            q_text_emb = model.encode(q_text[:512])
 
-                # Sort and filter
-                sorted_res = sorted(aggregated_scores.items(), key=lambda x: x[1], reverse=True)
+                        with get_db_connection() as conn:
+                            placeholders = ','.join(['?'] * len(ids_to_fuse))
+                            sql = f"SELECT id, text_embedding, COALESCE(ocr_full, ocr_text) as content FROM screenshots WHERE id IN ({placeholders})"
+                            rows = conn.execute(sql, ids_to_fuse).fetchall()
+
+                            for row in rows:
+                                sid = row['id']
+                                db_text = row['content'] or ""
+                                
+                                # A. Semantic (Lazy Generation + Validation)
+                                db_emb = None
+                                stored_blob = row['text_embedding']
+                                if stored_blob:
+                                    db_emb = np.frombuffer(stored_blob, dtype=np.float32)
+                                    if not np.isfinite(db_emb).all() or len(db_emb) == 0:
+                                        db_emb = None
+                                
+                                # Lazy generate if missing or invalid
+                                if db_emb is None and db_text and len(db_text) > 15 and model:
+                                    db_emb = model.encode(db_text[:512])
+                                
+                                if db_emb is not None and q_text_emb is not None:
+                                    norm = np.linalg.norm(db_emb)
+                                    if norm > 1e-10:
+                                        db_emb = db_emb / norm
+                                        sem_sim = np.dot(q_text_emb, db_emb)
+                                        aggregated_scores[sid]["semantic"] = max(0.0, float(sem_sim))
+                                
+                                # B. Jaccard Identifier Fusion
+                                db_ids = extract_identifiers(db_text)
+                                if q_ids and db_ids:
+                                    intersect = q_ids.intersection(db_ids)
+                                    union = q_ids.union(db_ids)
+                                    jaccard = len(intersect) / len(union) if union else 0
+                                    aggregated_scores[sid]["identifier"] = float(jaccard)
+
+                        # C. Face Identity Fusion
+                        q_faces_data = query_data.get("faces", [])
+                        if q_faces_data and v_manager.face_index:
+                            face_match_cache = {} # face_db_id -> score
+                            for q_face in q_faces_data:
+                                f_indices, f_scores = v_manager.search_face(q_face["embedding"], k=10)
+                                for f_idx, f_score in zip(f_indices, f_scores):
+                                    if f_idx == -1: continue
+                                    fid = int(f_idx)
+                                    face_match_cache[fid] = max(face_match_cache.get(fid, 0.0), float(f_score))
+                            
+                            if face_match_cache:
+                                fids = list(face_match_cache.keys())
+                                sqlite_fids = ','.join(['?'] * len(fids))
+                                with get_db_connection() as conn:
+                                    f_rows = conn.execute(f"SELECT id, screenshot_id FROM faces WHERE id IN ({sqlite_fids})", fids).fetchall()
+                                    for f_row in f_rows:
+                                        fid, sid = f_row['id'], f_row['screenshot_id']
+                                        f_score = face_match_cache[fid]
+                                        if sid not in aggregated_scores:
+                                            aggregated_scores[sid] = {"visual": 0.0, "semantic": 0.0, "face": 0.0, "identifier": 0.0}
+                                        aggregated_scores[sid]["face"] = max(aggregated_scores[sid]["face"], f_score)
+
+                    except Exception as e:
+                        print(f"[FUSION ERROR] {e}", file=sys.stderr)
+
+                # 4. Final Final Weighted Fusion
+                final_results = {}
+                for sid, comps in aggregated_scores.items():
+                    f_score = (comps["visual"] * weights["visual"] +
+                               comps["semantic"] * weights["semantic"] +
+                               comps["face"] * weights["face"] +
+                               comps["identifier"] * weights["identifier"])
+                    final_results[sid] = min(1.0, f_score)
+
+                # 5. Sort and Filter
+                sorted_res = sorted(final_results.items(), key=lambda x: x[1], reverse=True)
                 final_indices = [r[0] for r in sorted_res if r[1] >= SIMILARITY_THRESHOLD]
                 final_scores = [r[1] for r in sorted_res if r[1] >= SIMILARITY_THRESHOLD]
 
                 return {
-                    "search_type": "hybrid_image",
+                    "search_type": "multi_stage_fusion",
                     "visual": {"indices": final_indices, "scores": final_scores},
-                    "faces": [] # Keeping format, frontend handles specific face search
+                    "faces": [] 
                 }
             return {"error": "Visual index not available"}
 
@@ -749,10 +853,23 @@ def run_bridge():
         if not raw_line: continue
         try:
             req = json.loads(raw_line)
+            req_id = req.get("request_id")
+            mode = req.get("mode")
+            print(f"[PY RECEIVE] request_id: {req_id} mode: {mode}", file=sys.stderr, flush=True)
+
             result = handle_request(req)
+            
+            if isinstance(result, dict):
+                result["request_id"] = req_id
+                result["mode"] = mode
+            else:
+                # If result was a list (semantic_search etc), wrap it to include metadata
+                result = {"data": result, "request_id": req_id, "mode": mode}
+
+            print(f"[PY SEND] request_id: {req_id} mode: {mode}", file=sys.stderr, flush=True)
             bridge_print(result)
         except Exception as e:
-            bridge_print({"error": str(e)})
+            bridge_print({"error": str(e), "request_id": req.get("request_id") if 'req' in locals() else None})
 
 
 if __name__ == "__main__":

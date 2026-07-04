@@ -90,11 +90,13 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
     let duplicateOf = null;
     let similarity = 0;
     let cachedOcr = null;
+    let cachedOcrFull = null;
+    let cachedEmbedding = null;
 
     try {
       sha256 = await getFileHash(filePath);
       const exactMatch = await new Promise(resolve => {
-        db.get('SELECT id, ocr_text FROM screenshots WHERE sha256 = ? AND id != ? AND processing_status = "completed" LIMIT 1', [sha256, currentId], (err, row) => resolve(row));
+        db.get('SELECT id, ocr_text, ocr_full, text_embedding FROM screenshots WHERE sha256 = ? AND id != ? AND processing_status = "completed" LIMIT 1', [sha256, currentId], (err, row) => resolve(row));
       });
 
       if (exactMatch) {
@@ -102,10 +104,12 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
         duplicateOf = exactMatch.id;
         similarity = 1.0;
         cachedOcr = exactMatch.ocr_text;
+        cachedOcrFull = exactMatch.ocr_full;
+        cachedEmbedding = exactMatch.text_embedding;
       } else {
         phash = await imghash.hash(filePath);
         const nearMatch = await new Promise(resolve => {
-          db.get('SELECT id, ocr_text FROM screenshots WHERE original_hash = ? AND id != ? AND processing_status = "completed" LIMIT 1', [phash, currentId], (err, row) => resolve(row));
+          db.get('SELECT id, ocr_text, ocr_full, text_embedding FROM screenshots WHERE original_hash = ? AND id != ? AND processing_status = "completed" LIMIT 1', [phash, currentId], (err, row) => resolve(row));
         });
 
         if (nearMatch) {
@@ -113,6 +117,8 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
           duplicateOf = nearMatch.id;
           similarity = 0.95;
           cachedOcr = nearMatch.ocr_text;
+          cachedOcrFull = nearMatch.ocr_full;
+          cachedEmbedding = nearMatch.text_embedding;
         }
       }
     } catch (e) {
@@ -120,6 +126,7 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
     }
 
     if (duplicateOf) {
+      // 1. Inherit Metadata
       db.run(`
         UPDATE screenshots SET
           is_duplicate = 1,
@@ -128,12 +135,31 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
           sha256 = ?,
           original_hash = ?,
           ocr_text = ?,
+          ocr_full = ?,
+          text_embedding = ?,
           main_category = 'DUPLICATES',
           processing_status = 'completed'
         WHERE id = ?
-      `, [duplicateOf, similarity, sha256, phash, cachedOcr, currentId]);
+      `, [duplicateOf, similarity, sha256, phash, cachedOcr, cachedOcrFull, cachedEmbedding, currentId]);
 
-      db.log('DUPLICATE_DETECTED', `${fileName} is ${duplicateType} of ${duplicateOf} (OCR Reused)`, 'warning');
+      // 2. Fetch Parent for Visual Index inheritance
+      try {
+          const parentVectors = await bridge.request('retrieval_search', { 
+              type: "get_vectors", 
+              screenshot_id: duplicateOf 
+          });
+          if (parentVectors && !parentVectors.error) {
+              await bridge.request('retrieval_push_vectors', {
+                  screenshot_id: currentId,
+                  visual_embeddings: parentVectors.visual_embeddings,
+                  faces: [] // Faces are unique to coordinates, skip for now to be safe
+              });
+          }
+      } catch (e) {
+          console.warn('Duplicate FAISS inheritance failed:', e);
+      }
+
+      db.log('DUPLICATE_DETECTED', `${fileName} is ${duplicateType} of ${duplicateOf} (Metadata Inherited)`, 'warning');
       processingQueue.delete(filePath);
       return;
     }
@@ -222,59 +248,102 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
        // Fetch dynamic threshold from settings (with safe default)
        const qualityThreshold = await db.getSetting('face_quality_threshold', '0.1');
 
-       retrievalData = await bridge.request('retrieval_analyze', { 
-         image_path: filePath,
-         quality_threshold: qualityThreshold
-       });
-       
-       console.log(`[DEBUG][INDEX]\nFile: ${fileName}\nFaces detected: ${retrievalData?.faces?.length || 0}\nVisual embeddings: ${retrievalData?.visual_embedding ? 1 : 0}\nPatch embeddings: ${retrievalData?.patch_embeddings?.length || 0}\nMeeting IDs: ${retrievalData?.meeting_ids?.join(', ') || 'None'}`);
+        retrievalData = await bridge.request('retrieval_analyze', { 
+          image_path: filePath,
+          quality_threshold: qualityThreshold
+        });
 
-       if (retrievalData && !retrievalData.error) {
-           const facePushData = [];
-           if (retrievalData.faces) {
-             for (const face of retrievalData.faces) {
-               const faceId = await new Promise((resolve, reject) => {
-                 db.run(`
-                   INSERT INTO faces (screenshot_id, bbox, confidence, blur_score, face_quality_score, size_px)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                 `, [currentId, JSON.stringify(face.bbox), face.confidence, face.blur_score, face.face_quality_score, face.size_px], 
-                 function(err) { 
-                   if (err) reject(err);
-                   else resolve(this.lastID); 
-                 });
-               });
-               faceIdsTracked.push(faceId);
-               facePushData.push({ db_id: faceId, embedding: face.embedding });
-             }
-           }
+        // [DIAG][RETRIEVAL]
+        console.log("[DIAG][RETRIEVAL]");
+        console.log("typeof retrievalData:", typeof retrievalData);
+        if (retrievalData) console.log("Object.keys(retrievalData):", Object.keys(retrievalData));
+        console.log("typeof retrievalData.full_text:", typeof retrievalData?.full_text);
+        console.log("retrievalData.full_text length:", (retrievalData?.full_text || "").length);
+        console.log("typeof retrievalData.ocr_status:", typeof retrievalData?.ocr_status);
+        console.log("retrievalData.ocr_status:", JSON.stringify(retrievalData?.ocr_status));
+        
+        console.log(`[DEBUG][INDEX]\nFile: ${fileName}\nFaces detected: ${retrievalData?.faces?.length || 0}\nVisual embeddings: ${retrievalData?.visual_embedding ? 1 : 0}\nPatch embeddings: ${retrievalData?.patch_embeddings?.length || 0}\nMeeting IDs: ${retrievalData?.meeting_ids?.join(', ') || 'None'}`);
 
-           const visualEmbeddings = [retrievalData.visual_embedding, ...(retrievalData.patch_embeddings || [])];
-           await bridge.request('retrieval_push_vectors', {
-             screenshot_id: currentId,
-             visual_embeddings: visualEmbeddings,
-             faces: facePushData
-           });
-           
-           console.log(`[DEBUG] retrieval_push_vectors success: screenshot_id=${currentId}, faces=${facePushData.length}, visual=${visualEmbeddings.length}`);
-           
-           if (retrievalData.full_text) {
-             text = retrievalData.full_text;
-           }
-       } else if (retrievalData && retrievalData.error) {
-           // Log but continue if non-fatal
-           console.warn(`Retrieval indexing partial failure for ${fileName}: ${retrievalData.error}`);
-       }
-    } catch (e) {
-      console.error('Retrieval Indexing Failed:', e);
-      errorMessage += `Retrieval Indexing Failed; `;
-    }
+        if (retrievalData && !retrievalData.error) {
+            const facePushData = [];
+            if (retrievalData.faces) {
+              for (const face of retrievalData.faces) {
+                // [DIAG][BEFORE_AWAIT] INSERT faces
+                console.log("[DIAG][BEFORE_AWAIT] INSERT faces", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
+                const faceId = await new Promise((resolve, reject) => {
+                  db.run(`
+                    INSERT INTO faces (screenshot_id, bbox, confidence, blur_score, face_quality_score, size_px)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                  `, [currentId, JSON.stringify(face.bbox), face.confidence, face.blur_score, face.face_quality_score, face.size_px], 
+                  function(err) { 
+                    if (err) reject(err);
+                    else resolve(this.lastID); 
+                  });
+                });
+                // [DIAG][AFTER_AWAIT] INSERT faces
+                console.log("[DIAG][AFTER_AWAIT] INSERT faces", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
+                faceIdsTracked.push(faceId);
+                facePushData.push({ db_id: faceId, embedding: face.embedding });
+              }
+            }
+
+            const visualEmbeddings = [retrievalData.visual_embedding, ...(retrievalData.patch_embeddings || [])];
+            // [DIAG][BEFORE_AWAIT] retrieval_push_vectors
+            console.log("[DIAG][BEFORE_AWAIT] retrieval_push_vectors", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
+            await bridge.request('retrieval_push_vectors', {
+              screenshot_id: currentId,
+              visual_embeddings: visualEmbeddings,
+              faces: facePushData
+            });
+            // [DIAG][AFTER_AWAIT] retrieval_push_vectors
+            console.log("[DIAG][AFTER_AWAIT] retrieval_push_vectors", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
+            
+            console.log(`[DEBUG] retrieval_push_vectors success: screenshot_id=${currentId}, faces=${facePushData.length}, visual=${visualEmbeddings.length}`);
+            
+            if (retrievalData.full_text) {
+              text = retrievalData.full_text;
+              // [DIAG][TEXT_ASSIGN]
+              console.log("[DIAG][TEXT_ASSIGN]");
+              console.log("text length:", text.length);
+              console.log("retrievalData.full_text length:", (retrievalData?.full_text || "").length);
+              console.log("text === retrievalData.full_text:", text === retrievalData?.full_text);
+            }
+
+            // Robust OCR Status Handling (Backward Compatible)
+            const oStatus = retrievalData.ocr_status;
+            if (oStatus) {
+                let isErr = false;
+                let errReason = "";
+                if (typeof oStatus === 'string') {
+                    isErr = oStatus.startsWith("error");
+                    errReason = oStatus;
+                } else if (typeof oStatus === 'object') {
+                    isErr = oStatus.status === "error";
+                    errReason = oStatus.reason || "unknown AI error";
+                }
+                if (isErr) {
+                    errorMessage += `AI OCR Error: ${errReason}; `;
+                }
+            }
+        } else if (retrievalData && retrievalData.error) {
+            // Log but continue if non-fatal
+            console.warn(`Retrieval indexing partial failure for ${fileName}: ${retrievalData.error}`);
+        }
+     } catch (e) {
+       console.error('Retrieval Indexing Failed:', e);
+       errorMessage += `Retrieval Indexing Failed; `;
+     }
 
     // 5. Semantic Analysis
     let studyGroup = 'NONE';
     let semanticConfidence = 0;
     try {
       if (text.length > 30) {
+        // [DIAG][BEFORE_AWAIT] getSemanticGroup
+        console.log("[DIAG][BEFORE_AWAIT] getSemanticGroup", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
         studyGroup = await getSemanticGroup(text);
+        // [DIAG][AFTER_AWAIT] getSemanticGroup
+        console.log("[DIAG][AFTER_AWAIT] getSemanticGroup", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
         semanticConfidence = (studyGroup !== 'NONE' && studyGroup !== 'UNCATEGORIZED') ? 0.85 : 0;
       }
     } catch (e) {
@@ -478,7 +547,11 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
     }
 
     try {
+      // [DIAG][BEFORE_AWAIT] mkdir
+      console.log("[DIAG][BEFORE_AWAIT] mkdir", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
       await fs.promises.mkdir(organizedDir, { recursive: true });
+      // [DIAG][AFTER_AWAIT] mkdir
+      console.log("[DIAG][AFTER_AWAIT] mkdir", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
     } catch (e) {
       console.warn('Directory Creation Failed (might exist):', e.message);
     }
@@ -496,14 +569,22 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
       counter++;
     }
 
+    // [DIAG][BEFORE_AWAIT] copyFile
+    console.log("[DIAG][BEFORE_AWAIT] copyFile", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
     await fs.promises.copyFile(filePath, destPath);
+    // [DIAG][AFTER_AWAIT] copyFile
+    console.log("[DIAG][AFTER_AWAIT] copyFile", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
     db.log('PHYSICAL_MOVE', `${finalFileName} moved to ${mainCategory}`, 'success');
 
     // ── 10  Embedding ─────────────────────────────────────────────────────
     let embeddingBlob = null;
     try {
       if (text && text.length > 10) {
+        // [DIAG][BEFORE_AWAIT] embedding
+        console.log("[DIAG][BEFORE_AWAIT] embedding", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
         const embedding = await bridge.request('embedding', { text: text.substring(0, 1000) });
+        // [DIAG][AFTER_AWAIT] embedding
+        console.log("[DIAG][AFTER_AWAIT] embedding", "retrievalData.full_text length:", (retrievalData?.full_text || "").length, "text length:", text.length);
         if (embedding) {
           embeddingBlob = Buffer.from(new Float32Array(embedding).buffer);
         }
@@ -514,6 +595,16 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
 
     // ── 11  DB save (Transactional Wrap) ──────────────────────────────────
     try {
+      // [DIAG][UPDATE_PRE]
+      console.log("[DIAG][UPDATE_PRE]");
+      console.log("typeof retrievalData.full_text:", typeof retrievalData?.full_text);
+      console.log("retrievalData.full_text length:", (retrievalData?.full_text || "").length);
+      console.log("typeof text:", typeof text);
+      console.log("text length:", text.length);
+      console.log("retrievalData.full_text === text:", retrievalData?.full_text === text);
+      console.log("retrievalData.ocr_status:", JSON.stringify(retrievalData?.ocr_status));
+      console.log("value bound to ocr_full:", retrievalData ? retrievalData.full_text : null);
+
       await new Promise((resolve, reject) => {
         db.run(`
           UPDATE screenshots SET
@@ -535,13 +626,30 @@ async function processScreenshot(filePath, mainWindow, organizedRoot) {
           phash, ui_conf, semantic_conf,
           visual_conf, layout_conf, final_conf,
           embeddingBlob,
-          (retrievalData && retrievalData.full_text !== undefined && retrievalData.full_text !== null) ? retrievalData.full_text : null,
-          (retrievalData && retrievalData.meeting_ids) ? JSON.stringify(retrievalData.meeting_ids) : '[]',
+          retrievalData ? retrievalData.full_text : null,
+          (retrievalData && retrievalData.meeting_ids) ? JSON.stringify(retrievalData.meeting_ids) : null,
           errorMessage || null,
           currentId
-        ], (err) => {
-          if (err) reject(err);
-          else resolve();
+        ], async (err) => {
+          if (err) {
+            console.log("[DIAG][UPDATE_POST] UPDATE failed:", err.message);
+            reject(err);
+          } else {
+            console.log("[DIAG][UPDATE_POST] UPDATE succeeded");
+            try {
+              const row = await new Promise((res, rej) => {
+                db.get("SELECT LENGTH(ocr_text) as ocr_text_len, LENGTH(ocr_full) as ocr_full_len FROM screenshots WHERE id = ?", [currentId], (e, r) => {
+                  if (e) rej(e); else res(r);
+                });
+              });
+              if (row) {
+                 console.log(`[DIAG][UPDATE_POST] Row verification: ocr_text_len=${row.ocr_text_len}, ocr_full_len=${row.ocr_full_len}`);
+              }
+            } catch (vErr) {
+              console.log("[DIAG][UPDATE_POST] SELECT check failed:", vErr.message);
+            }
+            resolve();
+          }
         });
       });
     } catch (saveError) {

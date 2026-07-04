@@ -36,6 +36,13 @@ class VectorManager:
         print(f"Visual vector count: {self.visual_index.ntotal if self.visual_index else 0}", file=sys.stderr)
         print(f"Face index exists: {self.face_index is not None}", file=sys.stderr)
         print(f"Face vector count: {self.face_index.ntotal if self.face_index else 0}", file=sys.stderr)
+
+    def validate_vectors(self, vecs):
+        """Rigorous check for NaN, Inf, and non-finite values before FAISS entry."""
+        if not np.isfinite(vecs).all():
+            print("[CRITICAL] FAISS: Non-finite values detected in embedding. Sanitizing...", file=sys.stderr)
+            return np.nan_to_num(vecs)
+        return vecs
             
     def _ensure_index(self, index_type, dim):
         if index_type == "visual":
@@ -83,7 +90,12 @@ class VectorManager:
     def add_visual(self, screenshot_id, embeddings):
         """Add global + patch embeddings for a screenshot after clearing old ones."""
         embs = np.array(embeddings).astype('float32')
-        faiss.normalize_L2(embs)
+        embs = self.validate_vectors(embs)
+        
+        # Normalize for Inner Product (Cosine Similarity)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        # Avoid division by zero
+        embs = embs / (norms + 1e-10)
         
         print(f"[DEBUG] add_visual: screenshot_id={screenshot_id}, embeddings={len(embs)}", file=sys.stderr)
         
@@ -101,7 +113,10 @@ class VectorManager:
     def add_face(self, embedding, face_db_id):
         """Associate a face embedding with its DB ID after clearing old entry."""
         emb = np.array([embedding]).astype('float32')
-        faiss.normalize_L2(emb)
+        emb = self.validate_vectors(emb)
+        
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        emb = emb / (norms + 1e-10)
         
         print(f"[DEBUG] add_face: face_db_id={face_db_id}", file=sys.stderr)
         

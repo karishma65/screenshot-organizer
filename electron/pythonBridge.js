@@ -13,11 +13,12 @@ class PythonBridge extends EventEmitter {
   constructor() {
     super();
     this._proc = null;
-    this._queue = [];       // pending { resolve, reject, timeout }
+    this._pending = new Map(); // requestId -> { resolve, reject, timeout, mode }
     this._rl = null;
     this._booted = false;
     this._booting = false;
-    this._TIMEOUT_MS = 120000;
+    this._TIMEOUT_MS = 300000;
+    this._reqCounter = 0;
   }
 
   // ── Boot / keep-alive ──────────────────────────────────────────────────────
@@ -39,30 +40,51 @@ class PythonBridge extends EventEmitter {
       this._rl.on('line', line => {
         if (!line.trim()) return;
 
-        // Ready signal logic
-        if (initialResponse) {
-          try {
-            const msg = JSON.parse(line);
-            if (msg.ready) {
-              this._booted = true;
-              this._booting = false;
-              initialResponse = false;
-              this.emit('booted');
-              resolve();
-              return;
-            }
-          } catch (e) { }
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch (e) {
+          console.error(`[bridge] Fatal JSON parse error from Python: ${line}`);
+          return;
         }
 
-        const pending = this._queue.shift();
-        if (!pending) return;
+        // 1. Ready signal logic
+        if (initialResponse && parsed.ready) {
+          this._booted = true;
+          this._booting = false;
+          initialResponse = false;
+          this.emit('booted');
+          resolve();
+          return;
+        }
 
-        if (pending.timeout) clearTimeout(pending.timeout);
+        // 2. ID-based Matching
+        const requestId = parsed.request_id;
+        if (requestId === undefined || requestId === null) {
+          // Check if this is the "ready" signal arriving late
+          if (!parsed.ready) {
+            console.warn("[bridge] Response missing request_id (ignoring):", parsed);
+          }
+          return;
+        }
 
-        try {
-          pending.resolve(JSON.parse(line));
-        } catch (e) {
-          pending.reject(new Error(`Bridge JSON parse error: ${line}`));
+        const pending = this._pending.get(requestId);
+        if (!pending) {
+          // This is likely a late response for a request that already timed out
+          console.warn(`[bridge] Received late response for ID: ${requestId} (${parsed.mode}). Discarding.`);
+          return;
+        }
+
+        // Cleanup and Resolve/Reject order: 1. Timer, 2. Map, 3. Callback
+        if (pending.timeout) {
+          clearTimeout(pending.timeout);
+        }
+        this._pending.delete(requestId);
+
+        if (parsed.error) {
+          pending.reject(new Error(`Python Error [${pending.mode}]: ${parsed.error}`));
+        } else {
+          pending.resolve(parsed);
         }
       });
 
@@ -100,35 +122,35 @@ class PythonBridge extends EventEmitter {
   }
 
   _cleanupQueue(errorMsg) {
-    while (this._queue.length) {
-      const pending = this._queue.shift();
+    for (const [id, pending] of this._pending) {
       if (pending.timeout) clearTimeout(pending.timeout);
       pending.reject(new Error(errorMsg));
     }
+    this._pending.clear();
   }
 
   request(mode, payload) {
+    const requestId = ++this._reqCounter;
+
     return new Promise((resolve, reject) => {
       if (!this._booted) {
         return reject(new Error('PythonBridge not booted — call bridge.boot() first'));
       }
 
       const timeout = setTimeout(() => {
-        const idx = this._queue.findIndex(p => p.reject === reject);
-        if (idx !== -1) {
-          this._queue.splice(idx, 1);
-          reject(new Error(`PythonBridge request timeout [${mode}] after ${this._TIMEOUT_MS}ms`));
+        if (this._pending.has(requestId)) {
+          this._pending.delete(requestId);
+          reject(new Error(`PythonBridge request timeout [${mode}][id:${requestId}] after ${this._TIMEOUT_MS}ms`));
         }
       }, this._TIMEOUT_MS);
 
-      this._queue.push({ resolve, reject, timeout });
+      this._pending.set(requestId, { resolve, reject, timeout, mode });
 
-      const msg = JSON.stringify({ mode, ...payload }) + '\n';
+      const msg = JSON.stringify({ request_id: requestId, mode, ...payload }) + '\n';
       this._proc.stdin.write(msg, err => {
         if (err) {
-          const idx = this._queue.findIndex(p => p.reject === reject);
-          if (idx !== -1) {
-            this._queue.splice(idx, 1);
+          if (this._pending.has(requestId)) {
+            this._pending.delete(requestId);
             clearTimeout(timeout);
             reject(err);
           }
@@ -153,6 +175,7 @@ class PythonBridge extends EventEmitter {
       this._booted = false;
       this._booting = false;
     }
+    this._pending.clear();
   }
 }
 

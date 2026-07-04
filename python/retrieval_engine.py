@@ -49,12 +49,24 @@ class RetrievalEngine:
         print("[DIAG] AI models loaded successfully", file=sys.stderr, flush=True)
 
     def _get_ocr(self):
+        import time
         if self.ocr_model is None:
-            # Set environment variables BEFORE importing PaddleOCR
+            print("[PROFILE] Creating OCR pipeline...", file=sys.stderr, flush=True)
+            t_create_start = time.perf_counter()
+            # Set environment variables BEFORE importing PaddlePaddle/PaddleX
             os.environ["FLAGS_use_onednn"] = "0"
             os.environ["FLAGS_enable_pir_api"] = "0"
-            from paddleocr import PaddleOCR
-            self.ocr_model = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+            try:
+                import paddlex
+                # Recommended PaddleOCR 3.7 / PaddleX 3.7 Pipeline initialization
+                # This replaces the legacy PaddleOCR wrapper
+                self.ocr_model = paddlex.create_pipeline(pipeline="OCR")
+                print(f"[PROFILE] OCR pipeline created: {(time.perf_counter()-t_create_start)*1000:.2f}ms", file=sys.stderr, flush=True)
+            except Exception as e:
+                return {"status": "error", "reason": "initialization_failed", "details": str(e)}
+        else:
+            print("[PROFILE] Reusing cached OCR pipeline", file=sys.stderr, flush=True)
+                
         return self.ocr_model
 
     def get_blur_score(self, image):
@@ -91,31 +103,76 @@ class RetrievalEngine:
         return feats / feats.norm(p=2, dim=-1, keepdim=True)
 
     def analyze_screenshot(self, image_path, quality_threshold):
+        import time
+        t_start = time.perf_counter()
         if not os.path.exists(image_path): return {"error": "File not found"}
-        img_cv = cv2.imread(image_path)
-        with Image.open(image_path) as img_temp: img_pil = img_temp.convert('RGB')
         
-        full_text = ""
-        meeting_ids = []
+        # Robust Windows Unicode path reading
+        t0 = time.perf_counter()
         try:
-            print("[DIAG] Initializing OCR...", file=sys.stderr, flush=True)
-            ocr = self._get_ocr()
-            print("[DIAG] Running OCR...", file=sys.stderr, flush=True)
-            try: res = ocr.ocr(image_path, cls=True)
-            except: res = ocr.ocr(image_path)
-            
-            if res and res[0]:
-                print(f"[DIAG] OCR extracted {len(res[0])} lines", file=sys.stderr, flush=True)
-                for line in res[0]:
-                    text = line[1][0]
-                    full_text += text + " "
-                    m_ids = re.findall(r'[a-z0-9]{3}-[a-z0-9]{4}-[a-z0-9]{3}|[0-9]{3}-[0-9]{3}-[0-9]{3}', text.lower())
-                    meeting_ids.extend(m_ids)
-            else:
-                print("[DIAG] OCR result was empty", file=sys.stderr, flush=True)
+            im_data = np.fromfile(image_path, dtype=np.uint8)
+            img_cv = cv2.imdecode(im_data, cv2.IMREAD_COLOR)
         except Exception as e:
-            print(f"[DIAG] OCR ERROR: {str(e)}", file=sys.stderr, flush=True)
+            print(f"[DIAG] cv2 load failed: {e}", file=sys.stderr, flush=True)
+            img_cv = None
+        
+        with Image.open(image_path) as img_temp: img_pil = img_temp.convert('RGB')
+        print(f"[PROFILE] Image loading: {(time.perf_counter()-t0)*1000:.2f}ms", file=sys.stderr)
 
+        full_text = None
+        meeting_ids = []
+        ocr_status = {"status": "unprocessed"}
+        
+        if img_cv is not None and img_cv.size > 0:
+            try:
+                t_ocr_init = time.perf_counter()
+                ocr_result = self._get_ocr()
+                print(f"[PROFILE] OCR model check/init: {(time.perf_counter()-t_ocr_init)*1000:.2f}ms", file=sys.stderr)
+                
+                if isinstance(ocr_result, dict) and ocr_result.get("status") == "error":
+                    ocr_status = ocr_result
+                else:
+                    ocr = ocr_result
+                    full_text = ""
+                    try:
+                        t_predict = time.perf_counter()
+                        # Force generator evaluation to capture true inference time
+                        results = list(ocr.predict(img_cv))
+                        print(f"[PROFILE] OCR inference: {(time.perf_counter()-t_predict)*1000:.2f}ms", file=sys.stderr, flush=True)
+                        
+                        t_parse = time.perf_counter()
+                        ocr_processed = False
+                        for res in results:
+                            text_list = []
+                            if hasattr(res, 'output') and isinstance(res.output, dict) and "rec_texts" in res.output:
+                                text_list = res.output["rec_texts"]
+                            elif hasattr(res, 'rec_texts'):
+                                text_list = res.rec_texts
+                            elif isinstance(res, dict) and 'rec_texts' in res:
+                                text_list = res['rec_texts']
+
+                            if text_list:
+                                ocr_processed = True
+                                for text in text_list:
+                                    text_str = str(text)
+                                    full_text += text_str + " "
+                                    m_ids = re.findall(r'[a-z0-9]{3}-[a-z0-9]{4}-[a-z0-9]{3}|[0-9]{3}-[0-9]{3}-[0-9]{3}', text_str.lower())
+                                    meeting_ids.extend(m_ids)
+                        
+                        print(f"[PROFILE] OCR parsing/iteration: {(time.perf_counter()-t_parse)*1000:.2f}ms", file=sys.stderr)
+                        if ocr_processed:
+                            full_text = full_text.strip()
+                            ocr_status = {"status": "success"}
+                        else:
+                            ocr_status = {"status": "empty"}
+                    except Exception as e:
+                        print(f"[DIAG] 3.7 Inference Crash: {e}", file=sys.stderr)
+                        raise e
+            except Exception as e:
+                err_msg = str(e)
+                ocr_status = {"status": "error", "reason": "runtime_failed", "details": err_msg[:100]}
+
+        t_face = time.perf_counter()
         faces = self.face_app.get(img_cv)
         face_data = []
         qt = float(quality_threshold)
@@ -127,13 +184,17 @@ class RetrievalEngine:
             q = self.calculate_face_quality(float(face.det_score), self.get_blur_score(crop), w*h)
             if q < qt: continue
             face_data.append({"bbox": bbox, "embedding": face.embedding.tolist(), "confidence": float(face.det_score), "face_quality_score": q})
+        print(f"[PROFILE] InsightFace: {(time.perf_counter()-t_face)*1000:.2f}ms", file=sys.stderr)
 
+        t_siglip = time.perf_counter()
         inputs = self.siglip_processor(images=img_pil, return_tensors="pt").to(self.device)
         with torch.no_grad():
             img_outputs = self.siglip_model.get_image_features(**inputs)
             img_outputs = self._normalize(img_outputs)
             v_emb = img_outputs.cpu().numpy()[0].tolist()
+        print(f"[PROFILE] SigLIP Global: {(time.perf_counter()-t_siglip)*1000:.2f}ms", file=sys.stderr)
             
+        t_patches = time.perf_counter()
         p_embs = []
         patches = self.get_patches(img_pil)
         if patches:
@@ -142,8 +203,17 @@ class RetrievalEngine:
                 p_out = self.siglip_model.get_image_features(**p_in)
                 p_out = self._normalize(p_out)
                 p_embs = p_out.cpu().numpy().tolist()
-            
-        return {"full_text": full_text.strip(), "meeting_ids": list(set(meeting_ids)), "faces": face_data, "visual_embedding": v_emb, "patch_embeddings": p_embs}
+        print(f"[PROFILE] SigLIP Patches ({len(patches)}): {(time.perf_counter()-t_patches)*1000:.2f}ms", file=sys.stderr)
+        
+        print(f"[PROFILE] TOTAL analyze_screenshot: {(time.perf_counter()-t_start)*1000:.2f}ms", file=sys.stderr)
+        return {
+            "full_text": full_text.strip() if full_text is not None else None,
+            "meeting_ids": list(set(meeting_ids)),
+            "faces": face_data,
+            "visual_embedding": v_emb,
+            "patch_embeddings": p_embs,
+            "ocr_status": ocr_status
+        }
 
     def encode_text(self, text):
         inputs = self.siglip_processor(text=[text], return_tensors="pt", padding=True).to(self.device)
